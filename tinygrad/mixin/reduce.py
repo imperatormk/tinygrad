@@ -10,6 +10,8 @@ from tinygrad.mixin.movement import MovementMixin
 class ReduceMixin(DTypeMixin, MovementMixin):
   def _rop(self, op: Ops, axis: tuple[int, ...]) -> Self:
     raise NotImplementedError
+  def _scanop(self, op: Ops, axis: tuple[int, ...]) -> Self:
+    raise NotImplementedError
 
   def _reduce(self, op:Ops, axis:int|Sequence[int]|None=None, keepdim=False) -> Self:
     axis = tuple(self._resolve_dim(x) for x in (range(self.ndim) if axis is None else make_tuple(axis, 1)))
