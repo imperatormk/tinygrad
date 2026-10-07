@@ -610,7 +610,7 @@ jobs:
         renderer: [IR3, CL]
     name: Linux (qcom a630 ${{ matrix.renderer }})
     runs-on: *linux
-    timeout-minutes: 45
+    timeout-minutes: 20
     env:
       DEV: MOCK+QCOM:${{ matrix.renderer }}
       SKIP_SLOW_TEST: 1

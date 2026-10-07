@@ -11,7 +11,8 @@ class QCOMGPU:
   def __init__(self, mappings:dict[tuple[str, int], tuple[int, int]]):
     self.regs:dict[int, int] = {}
     self.mappings = mappings
-    self.consts, self.shader, self.samplers = np.zeros(4096, np.uint32), b"", []
+    self.consts, self.shader = np.zeros(4096, np.uint32), b""
+    self.samplers:list[bool] = []
     self.errors:list[Exception] = []
     self.pending:list[list[int]] = []
     self.draining = 0 # after an error, IBs already queued only signal

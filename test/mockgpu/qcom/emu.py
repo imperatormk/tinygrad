@@ -225,11 +225,11 @@ class Threads:
       if (self.mask & ((idx < 0) | (idx >= len(self.d.consts)))).any(): raise RuntimeError(f"relative const c<a0.x + {s.val}> out of range")
       raw = self.d.consts[np.clip(idx, 0, len(self.d.consts) - 1)]
     else:
-      if s.kind == "c": v = int(self.d.consts[s.val] if self.d.demote or not s.half else self.d.consts.view(np.uint16)[s.val])
-      else: v = s.val & 0xFFFFFFFF
+      if s.kind == "c": c = int(self.d.consts[s.val] if self.d.demote or not s.half else self.d.consts.view(np.uint16)[s.val])
+      else: c = s.val & 0xFFFFFFFF
       if s.kind == "c" and s.half and dt == np.float16 and self.d.demote: # SP_MODE_CNTL.CONSTANT_DEMOTION_ENABLE: half float ops convert f32 consts
-        v = int(np.uint32(v).view(np.float32).astype(np.float16).view(np.uint16))
-      raw = np.full(self.mask.shape, v & 0xFFFF if s.half else v, view("u", s.half))
+        c = int(np.uint32(c).view(np.float32).astype(np.float16).view(np.uint16))
+      raw = np.full(self.mask.shape, c & 0xFFFF if s.half else c, view("u", s.half))
     v = raw.view(dt) if raw.dtype.itemsize == dt.itemsize else raw.astype(dt)
     if s.absneg & 2: v = np.abs(v)
     if s.absneg & 1: v = -v
@@ -363,7 +363,8 @@ def exec_mem(t:Threads, i:Load|Store, k:int):
     if bad.any() and i.op != mesa.OPC_LDP: raise RuntimeError(f"pc {i.pc}: out of bounds local/private access")
     lanes, outside = t.mask.copy(), t.mask.copy()
     lanes[t.mask], outside[t.mask] = ~bad, bad
-    for c in range(i.size if bad.any() else 0): t.write(i.dst + c, half, np.zeros(len(t.mask), dt), outside) # ldp past the private size reads 0
+    if bad.any() and isinstance(i, Load): # ldp past the private size reads 0
+      for c in range(i.size): t.write(i.dst + c, half, np.zeros(len(t.mask), dt), outside)
     views = [(lanes, mem, (base[t.mask] + offs)[~bad])]
   for lanes, mem, offs in views:
     for c in range(i.size):
