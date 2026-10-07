@@ -64,7 +64,7 @@ class QCOMGPU:
       to_mv(u64(d[1], d[2]), 8).cast("Q")[0] = time.perf_counter_ns() * 192 // 10000 # 19.2MHz ticks
     elif op == mesa.CP_LOAD_STATE6_FRAG: self._load_state(d)
     elif op == mesa.CP_EXEC_CS: self._exec_cs(d[1:4])
-    elif op == mesa.CP_RUN_OPENCL: raise RuntimeError("CP_RUN_OPENCL is not emulated, use QCOM:IR3")
+    elif op == mesa.CP_RUN_OPENCL: self._exec_cs([self.regs[mesa.REG_A6XX_SP_CS_KERNEL_GROUP_X + k] for k in range(3)])
     else: raise RuntimeError(f"unsupported pkt7 opcode {op:#x}")
     return True
 
@@ -104,14 +104,15 @@ class QCOMGPU:
 
   def _exec_cs(self, groups:list[int]):
     nd, cfg, mode = self.regs[mesa.REG_A6XX_SP_CS_NDRANGE_0], self.regs[mesa.REG_A6XX_SP_CS_CONST_CONFIG_0], self.regs[mesa.REG_A6XX_SP_MODE_CNTL]
-    if not mode & mesa.A6XX_SP_MODE_CNTL_CONSTANT_DEMOTION_ENABLE or field(mode, "A6XX_SP_MODE_CNTL_ISAMMODE") != mesa.ISAMMODE_GL:
-      raise RuntimeError(f"unsupported SP_MODE_CNTL {mode:#x}") # emu.py demotes f32 consts for half ops and runs isam in GL mode
+    demote = bool(mode & mesa.A6XX_SP_MODE_CNTL_CONSTANT_DEMOTION_ENABLE)
+    if field(mode, "A6XX_SP_MODE_CNTL_ISAMMODE") != (mesa.ISAMMODE_GL if demote else mesa.ISAMMODE_CL):
+      raise RuntimeError(f"unsupported SP_MODE_CNTL {mode:#x}")
     local = tuple(field(nd, f"A6XX_SP_CS_NDRANGE_0_LOCALSIZE{c}") + 1 for c in "XYZ")
     lmem_size = (field(self.regs[mesa.REG_A6XX_SP_CS_CNTL_0 + 1], "A6XX_SP_CS_CNTL_1_SHARED_SIZE") + 1) * 1024
-    pvt_size = field(self.regs[mesa.REG_A6XX_SP_CS_PVT_MEM_PARAM], "A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM") * 512
+    pvt_size = field(self.regs[mesa.REG_A6XX_SP_CS_PVT_MEM_PARAM], "A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM") * 512 or (0 if demote else 512)
     ntex, nuav = (field(self.regs[mesa.REG_A6XX_SP_CS_CONFIG], f"A6XX_SP_CS_CONFIG_{f}") for f in ("NTEX", "NUAV"))
     textures = self._images(self._reg64(mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE), ntex, tex=True) if ntex else []
     ibos = self._images(self._reg64(mesa.REG_A6XX_SP_CS_UAV_BASE), nuav, tex=False) if nuav else []
     emu.run(emu.Dispatch(self.shader, self.consts, local, tuple(groups), field(cfg, "A6XX_SP_CS_CONST_CONFIG_0_LOCALIDREGID"),
                          field(cfg, "A6XX_SP_CS_CONST_CONFIG_0_WGIDCONSTID"), lmem_size, pvt_size, list(self.mappings.values()),
-                         textures, ibos))
+                         textures, ibos, demote))
