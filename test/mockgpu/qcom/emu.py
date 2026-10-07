@@ -7,7 +7,7 @@ from tinygrad.runtime.autogen import mesa
 
 NREGS = 64 * 4 # regid = gpr*4 + component
 A0, P0 = 61 * 4, 62 * 4 # a0 and p0 live in the full register file
-TYPES = [np.dtype(t) for t in ("f2", "f4", "u2", "u4", "i2", "i4", "u1", "i1")] # last is u8_32, it sign-extends
+TYPES = [np.dtype(t) for t in ("f2", "f4", "u2", "u4", "i2", "i4", "u1", "i1")] # last is u8_32
 HALF_TYPES = (0, 2, 4, 6, 7)
 FLUT = [0.0, 0.5, 1.0, 2.0, math.e, math.pi, 1/math.pi, 1/math.log2(math.e), math.log2(math.e), 1/math.log2(10), math.log2(10), 4.0]
 
@@ -195,7 +195,7 @@ class Dispatch:
   lmem_size:int; pvt_size:int; ranges:list[tuple[int, int]]; textures:list[Image]; ibos:list[Image]; demote:bool; samplers:list[bool] # noqa: E702
   entry:int; merged:bool # noqa: E702
 
-class MergedHalf: # SP_CS_CNTL_0.MERGEDREGS: hrN.c is the low (c even) or high half of full component (N*4+c) // 2
+class MergedHalf: # hrN.c is the low (c even) or high half of full component (N*4+c) // 2
   def __init__(self, r:np.ndarray): self.r16 = r.view(np.uint16)
   def __getitem__(self, k:int) -> np.ndarray: return self.r16[k // 2][k % 2::2]
   def __setitem__(self, k:int|tuple[int, np.ndarray], v:np.ndarray):
@@ -293,7 +293,7 @@ CAT4:dict[int, Callable] = {mesa.OPC_RCP: np.reciprocal, mesa.OPC_RSQ: lambda x:
   mesa.OPC_EXP2: np.exp2, mesa.OPC_SIN: np.sin, mesa.OPC_SQRT: np.sqrt, mesa.OPC_HRSQ: lambda x: 1 / np.sqrt(x), mesa.OPC_HLOG2: np.log2,
   mesa.OPC_HEXP2: np.exp2}
 
-def cov_to_float(v, dt, even=False): # round mode 0 is toward zero, f16 overflow saturates; 1 is (even)
+def cov_to_float(v, dt, even=False):
   with np.errstate(over="ignore"): r = v.astype(dt)
   if not even: r = np.where(np.abs(r.astype(np.float64)) > np.abs(v.astype(np.float64)), np.nextafter(r, dt.type(0)), r).astype(dt)
   return np.where(np.abs(r) < np.finfo(dt).tiny, np.copysign(dt.type(0), r), r) if dt == np.float16 else r
@@ -332,7 +332,7 @@ def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
   else:
     kind, fn = (CAT2 if isinstance(i, Cat2) else CAT3)[i.op]
     out = fn(*[ftz(t.read(s, view(kind, s.half))) for s in srcs])
-    if isinstance(i, Cat2) and i.ei: # the 33-bit sum >> 1
+    if isinstance(i, Cat2) and i.ei:
       out = ((t.read(srcs[0], np.dtype(np.uint32)).astype(np.uint64) + t.read(srcs[1], np.dtype(np.uint32))) >> np.uint64(1)).astype(np.uint32)
   out = ftz(out) if i.op == mesa.OPC_SEL_F32 else canonical_nan(ftz(out))
   sat = i.sat and not (isinstance(i, Cat2) and i.op in CMPS)
