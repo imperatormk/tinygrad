@@ -255,7 +255,7 @@ class Allocator(Generic[DeviceType]):
   def alloc(self, size:int, options:BufferSpec|None=None) -> BufferStorage:
     assert size > 0, f"alloc size must be positive, getting {size}"
     if len(c:=self.cache[(size, options)]):
-      # a freed buffer can still be in use by queued work: the cpu must not write it before that work is done
+      # queued work may still use a freed buffer
       if options is not None and options.cpu_access: self.dev.synchronize()
       return c.pop()
     spec = options if options is not None else self.default_buffer_spec

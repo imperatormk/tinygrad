@@ -222,7 +222,7 @@ class QCOMProgramData:
 
       # see https://elixir.bootlin.com/mesa/mesa-25.3.0/source/src/freedreno/ir3/ir3_shader.h#L525
       # and https://elixir.bootlin.com/mesa/mesa-25.3.0/source/src/freedreno/ir3/ir3_compiler_nir.c#L5389
-      # stores index the IBOs by image, so every image gets one: an image that is read and written is in both tables
+      # stores index the IBOs by image: an image that is read and written is in both tables
       self.samp_cnt, self.tex_cnt, self.ibo_cnt, self.tex_base = (nt:=v.image_mapping.num_tex), nt, v.num_uavs, v.num_uavs - nt
       self.tex_to_image = v.image_mapping.tex_to_image[:]
       # IR3 outputs a sampler for every texture (https://elixir.bootlin.com/mesa/mesa-25.3.0/source/src/freedreno/ir3/ir3_compiler_nir.c#L1714)
@@ -330,7 +330,6 @@ class QCOMDevice(Compiled):
     info = kgsl.struct_kgsl_devinfo()
     kgsl.IOCTL_KGSL_DEVICE_GETPROPERTY(self.fd, type=kgsl.KGSL_PROP_DEVICE_INFO, value=ctypes.addressof(info), sizebytes=ctypes.sizeof(info))
     self.gpu_id = (info.chip_id >> 24, (info.chip_id >> 16) & 0xFF, (info.chip_id >> 8) & 0xFF)
-    # private memory is laid out per fiber: the a640 has 4x the fibers of the a630
     dev_id = mesa.struct_fd_dev_id(self.gpu_id[0] * 100 + self.gpu_id[1] * 10 + self.gpu_id[2], info.chip_id)
     self.fibers_per_sp = mesa.fd_dev_info(dev_id).fibers_per_sp or 128 * 16
 
