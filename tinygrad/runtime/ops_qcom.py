@@ -295,6 +295,8 @@ class QCOMAllocator(Allocator['QCOMDevice']):
   def _free(self, storage:BufferStorage, options:BufferSpec):
     self.dev.synchronize()
     self.dev._gpu_free(storage)
+  def _map(self, buf:Buffer) -> BufferStorage: return self.dev._gpu_map(buf.host.addr, buf.nbytes)
+  def _unmap(self, mapping:BufferStorage): self._free(mapping, BufferSpec())
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
 def flag(nm, val): return (val << getattr(kgsl, f"{nm}_SHIFT")) & getattr(kgsl, f"{nm}_MASK")
