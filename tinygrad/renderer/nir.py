@@ -319,5 +319,7 @@ class IR3Renderer(NIRRenderer):
 
     self.b.shader.contents.info.num_ubos = len([u for u in bufs if not is_image_shape(u._shape)])
     self.b.shader.contents.info.num_images = texs() + imgs()
+    # without a rounding mode ir3 leaves cov's round field 0, which is toward zero
+    self.b.shader.contents.info.float_controls_execution_mode = (1 << 15) | (1 << 16) # FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP16 | _FP32
 
   def supported_dtypes(self): return {d for d in NIRRenderer.supported_dtypes(self) if d != dtypes.double}
