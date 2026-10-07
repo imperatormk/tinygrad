@@ -610,7 +610,7 @@ jobs:
         renderer: [IR3, CL]
     name: Linux (qcom a630 ${{ matrix.renderer }})
     runs-on: *linux
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       DEV: MOCK+QCOM:${{ matrix.renderer }}
       SKIP_SLOW_TEST: 1
@@ -644,8 +644,11 @@ jobs:
           IMAGE=1 python -m pytest -n=auto test/runtime/test_ops.py --durations=20
       - name: Run TRANSCENDENTAL math
         run: TRANSCENDENTAL=2 python -m pytest -n=auto test/runtime/test_ops.py::TestOps::test_sin test/runtime/test_ops.py::TestOps::test_cos test/runtime/test_ops.py::TestOps::test_tan test/runtime/test_ops.py::TestOps::test_exp test/runtime/test_ops.py::TestOps::test_log --durations=20
-      - name: Test openpilot dmonitoring_model
-        run: IMAGE=1 FLOAT16=1 python examples/openpilot/compile_onnx.py "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/dmonitoring_model.onnx" /tmp/openpilot.pkl --benchmark-runs 1
+      - name: Test openpilot models
+        run: |
+          for model in dmonitoring_model driving_supercombo; do
+            IMAGE=1 FLOAT16=1 python examples/openpilot/compile_onnx.py "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" /tmp/openpilot.pkl --benchmark-runs 1
+          done
       - name: Run process replay tests
         uses: ./.github/actions/process-replay
 
