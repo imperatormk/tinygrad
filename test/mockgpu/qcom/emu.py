@@ -26,6 +26,7 @@ class Src:
 def multisrc(x:int, half:bool, r:int) -> Src:
   absneg = getbits(x, 14, 15)
   if getbits(x, 11, 13) == 0b000: return Src("r", getbits(x, 0, 7), half, absneg, bool(r))
+  if getbits(x, 10, 13) == 0b0011 and not half: return Src("c<", sext(getbits(x, 0, 9), 10), half, absneg) # c<a0.x + off>
   if getbits(x, 11, 12) == 0b10: return Src("c", getbits(x, 0, 10), half, absneg, bool(r))
   if getbits(x, 11, 13) == 0b100: return Src("i", sext(getbits(x, 0, 10), 11), half, absneg)
   if getbits(x, 11, 13) == 0b101:
@@ -187,10 +188,19 @@ class Image: addr:int; width:int; height:int; pitch:int; dtype:np.dtype # noqa: 
 class Dispatch:
   image:bytes; consts:np.ndarray; local_size:tuple[int, ...]; groups:tuple[int, ...]; localid_reg:int; wgid_reg:int # noqa: E702
   lmem_size:int; pvt_size:int; ranges:list[tuple[int, int]]; textures:list[Image]; ibos:list[Image]; demote:bool; samplers:list[bool] # noqa: E702
+  entry:int; merged:bool # noqa: E702
+
+class MergedHalf: # SP_CS_CNTL_0.MERGEDREGS: hrN.c is the low (c even) or high half of full component (N*4+c) // 2
+  def __init__(self, r:np.ndarray): self.r16 = r.view(np.uint16)
+  def __getitem__(self, k:int) -> np.ndarray: return self.r16[k // 2][k % 2::2]
+  def __setitem__(self, k:int|tuple[int, np.ndarray], v:np.ndarray):
+    if isinstance(k, tuple): self[k[0]][k[1]] = v
+    else: self[k][:] = v
 
 class Threads:
   def __init__(self, d:Dispatch, n:int):
-    self.d, self.r, self.h = d, np.zeros((NREGS, n), np.uint32), np.zeros((NREGS, n), np.uint16)
+    self.d, self.r = d, np.zeros((NREGS, n), np.uint32)
+    self.h:np.ndarray|MergedHalf = MergedHalf(self.r) if d.merged else np.zeros((NREGS, n), np.uint16)
     self.everyone = self.mask = np.ones(n, bool)
     self.maps = sorted(d.ranges)
     self.starts, self.ends = np.array([s for s,_ in self.maps], np.uint64), np.array([s + sz for s,sz in self.maps], np.uint64)
@@ -205,6 +215,10 @@ class Threads:
     if s.kind == "r":
       raw = (self.h if s.half and s.val < A0 else self.r)[s.val]
       if s.half and raw.dtype == np.uint32: raw = raw.astype(np.uint16)
+    elif s.kind == "c<":
+      idx = self.r[A0].view(np.int32).astype(np.int64) + s.val
+      if (self.mask & ((idx < 0) | (idx >= len(self.d.consts)))).any(): raise RuntimeError(f"relative const c<a0.x + {s.val}> out of range")
+      raw = self.d.consts[np.clip(idx, 0, len(self.d.consts) - 1)]
     else:
       if s.kind == "c": v = int(self.d.consts[s.val] if self.d.demote or not s.half else self.d.consts.view(np.uint16)[s.val])
       else: v = s.val & 0xFFFFFFFF
@@ -242,7 +256,7 @@ CMPS = {mesa.OPC_CMPS_F: "f", mesa.OPC_CMPS_U: "u", mesa.OPC_CMPS_S: "i", mesa.O
 CMPV = {mesa.OPC_CMPV_F, mesa.OPC_CMPV_U, mesa.OPC_CMPV_S}
 CAT2_1SRC = {mesa.OPC_SIGN_F, mesa.OPC_ABSNEG_F, mesa.OPC_FLOOR_F, mesa.OPC_TRUNC_F, mesa.OPC_ABSNEG_S, mesa.OPC_NOT_B, mesa.OPC_CLZ_B}
 BITWISE = {mesa.OPC_AND_B, mesa.OPC_OR_B, mesa.OPC_XOR_B, mesa.OPC_NOT_B}
-CAT0 = {mesa.OPC_NOP, mesa.OPC_END, mesa.OPC_JUMP, mesa.OPC_BR, mesa.OPC_BRAO, mesa.OPC_BRAA, mesa.OPC_PREDT, mesa.OPC_PREDF, mesa.OPC_PREDE}
+CAT0 = {mesa.OPC_NOP, mesa.OPC_END, mesa.OPC_JUMP, mesa.OPC_CALL, mesa.OPC_RET, mesa.OPC_BR, mesa.OPC_BRAO, mesa.OPC_BRAA, mesa.OPC_PREDT, mesa.OPC_PREDF, mesa.OPC_PREDE}
 # op -> (src kind, fn)
 CAT2:dict[int, tuple[str, Callable]] = {
   mesa.OPC_ADD_F: ("f", np.add), mesa.OPC_MIN_F: ("f", fmin), mesa.OPC_MAX_F: ("f", fmax), mesa.OPC_MUL_F: ("f", np.multiply),
@@ -259,7 +273,7 @@ CAT2:dict[int, tuple[str, Callable]] = {
 CAT3_HALF = {mesa.OPC_MAD_F16, mesa.OPC_SEL_B16}
 CAT3:dict[int, tuple[str, Callable]] = {
   mesa.OPC_MADSH_M16: ("u", lambda a, b, c: (lo(a, 16) * (b >> 16) << 16) + c), # lo(src1) * hi(src2)
-  mesa.OPC_MADSH_U16: ("u", lambda a, b, c: (lo(a, 16) * (b >> 16) << 16) + c), mesa.OPC_MAD_S24: ("u", lambda a, b, c: s24(a) * s24(b) + c),
+  mesa.OPC_MADSH_U16: ("u", lambda a, b, c: (lo(a, 16) * (b >> 16) << 16) + c), mesa.OPC_MAD_U16: ("u", lambda a, b, c: lo(a, 16) * lo(b, 16) + c), mesa.OPC_MAD_S24: ("u", lambda a, b, c: s24(a) * s24(b) + c),
   mesa.OPC_SEL_S32: ("i", lambda a, b, c: np.where(b >= 0, a, c)), mesa.OPC_SEL_F32: ("f", lambda a, b, c: np.where(b >= 0, a, c)),
   mesa.OPC_MAD_F16: ("f", lambda a, b, c: ftz(a * b) + c), mesa.OPC_MAD_F32: ("f", lambda a, b, c: ftz(a * b) + c), # unfused, product flushed
   mesa.OPC_SEL_B16: ("u", lambda a, b, c: np.where(b != 0, a, c)), mesa.OPC_SEL_B32: ("u", lambda a, b, c: np.where(b != 0, a, c)),
@@ -310,8 +324,9 @@ def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
     kind, fn = (CAT2 if isinstance(i, Cat2) else CAT3)[i.op]
     out = fn(*[ftz(t.read(s, view(kind, s.half))) for s in srcs])
   out = ftz(out) if i.op == mesa.OPC_SEL_F32 else canonical_nan(ftz(out))
-  if i.sat and out.dtype.kind != "f": raise i.error()
-  t.write(i.dst + k, i.dst_half, np.clip(out, 0, 1) if i.sat else out)
+  sat = i.sat and not (isinstance(i, Cat2) and i.op in CMPS)
+  if sat and out.dtype.kind != "f": raise i.error()
+  t.write(i.dst + k, i.dst_half, np.clip(out, 0, 1) if sat else out)
 
 def global_lanes(t:Threads, i:Ldg|Stg, nbytes:int) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
   addrs = (t.r[i.addr].astype(np.uint64) | (t.r[i.addr + 1].astype(np.uint64) << np.uint64(32))) + np.uint64(i.offset & (2**64 - 1))
@@ -333,8 +348,12 @@ def exec_mem(t:Threads, i:Load|Store, k:int):
   else:
     mem, base, size = t.mems[i.op]
     offs = t.r[i.addr][t.mask].astype(np.int64) + i.offset
-    if (offs < 0).any() or (offs + dt.itemsize * i.size > size).any(): raise RuntimeError(f"pc {i.pc}: out of bounds local/private access")
-    views = [(t.mask, mem, base[t.mask] + offs)]
+    bad = (offs < 0) | (offs + dt.itemsize * i.size > size)
+    if bad.any() and i.op != mesa.OPC_LDP: raise RuntimeError(f"pc {i.pc}: out of bounds local/private access")
+    lanes, outside = t.mask.copy(), t.mask.copy()
+    lanes[t.mask], outside[t.mask] = ~bad, bad
+    for c in range(i.size if bad.any() else 0): t.write(i.dst + c, half, np.zeros(len(t.mask), dt), outside) # ldp past the private size reads 0
+    views = [(lanes, mem, (base[t.mask] + offs)[~bad])]
   for lanes, mem, offs in views:
     for c in range(i.size):
       idx = offs[:, None] + np.arange(dt.itemsize) + c * dt.itemsize
@@ -390,7 +409,8 @@ def run(d:Dispatch):
   for reg, v, dims in [(d.localid_reg, lid, d.local_size), (d.wgid_reg, gid, d.groups)]:
     if reg != 0xfc: t.r[reg], t.r[reg + 1], t.r[reg + 2] = v % dims[0], (v // dims[0]) % dims[1], v // (dims[0] * dims[1])
   pc, done, blocked = np.zeros(len(tid), np.int64), np.zeros(len(tid), bool), np.zeros(len(tid), bool)
-  together:int|None = 0 # pc while nothing has diverged
+  calls, depth = np.zeros((16, len(tid)), np.int64), np.zeros(len(tid), np.int64) # return addresses per thread
+  together:int|None = d.entry # pc while nothing has diverged
   with np.errstate(all="ignore"):
     while not done.all():
       if together is not None: cur, t.mask = together, t.everyone
@@ -415,6 +435,14 @@ def run(d:Dispatch):
         if i.op == mesa.OPC_END: done |= t.mask
         elif i.op in (mesa.OPC_PREDT, mesa.OPC_PREDF): pc[t.mask & ((t.r[P0] != 0) == (i.op == mesa.OPC_PREDF))] = i.target
         elif i.op == mesa.OPC_JUMP: pc[t.mask] = i.target
+        elif i.op == mesa.OPC_CALL:
+          if (depth[t.mask] >= len(calls)).any(): raise RuntimeError(f"pc {cur}: call stack overflow")
+          calls[depth[t.mask], np.nonzero(t.mask)[0]], pc[t.mask] = cur + 1, i.target
+          depth[t.mask] += 1
+        elif i.op == mesa.OPC_RET:
+          if (depth[t.mask] == 0).any(): raise RuntimeError(f"pc {cur}: ret without call")
+          depth[t.mask] -= 1
+          pc[t.mask] = calls[depth[t.mask], np.nonzero(t.mask)[0]]
         elif i.op in (mesa.OPC_BR, mesa.OPC_BRAO, mesa.OPC_BRAA):
           cond = (t.r[P0 + i.comp1] != 0) ^ bool(i.inv1)
           if i.op == mesa.OPC_BRAO: cond |= (t.r[P0 + i.comp2] != 0) ^ bool(i.inv2)

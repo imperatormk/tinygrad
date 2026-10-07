@@ -115,4 +115,5 @@ class QCOMGPU:
     ibos = self._images(self._reg64(mesa.REG_A6XX_SP_CS_UAV_BASE), nuav, tex=False) if nuav else []
     emu.run(emu.Dispatch(self.shader, self.consts, local, tuple(groups), field(cfg, "A6XX_SP_CS_CONST_CONFIG_0_LOCALIDREGID"),
                          field(cfg, "A6XX_SP_CS_CONST_CONFIG_0_WGIDCONSTID"), lmem_size, pvt_size, list(self.mappings.values()),
-                         textures, ibos, demote, self.samplers))
+                         textures, ibos, demote, self.samplers, self.regs[mesa.REG_A6XX_SP_CS_PROGRAM_COUNTER_OFFSET],
+                         bool(self.regs[mesa.REG_A6XX_SP_CS_CNTL_0] & mesa.A6XX_SP_CS_CNTL_0_MERGEDREGS)))
