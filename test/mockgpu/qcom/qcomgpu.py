@@ -11,7 +11,7 @@ class QCOMGPU:
   def __init__(self, mappings:dict[tuple[str, int], tuple[int, int]]):
     self.regs:dict[int, int] = {}
     self.mappings = mappings
-    self.consts, self.shader = np.zeros(4096, np.uint32), b""
+    self.consts, self.shader, self.samplers = np.zeros(4096, np.uint32), b"", []
     self.errors:list[Exception] = []
     self.pending:list[list[int]] = []
     self.draining = 0 # after an error, IBs already queued only signal
@@ -76,11 +76,11 @@ class QCOMGPU:
     elif (typ, block) == (mesa.ST_SHADER, mesa.SB6_CS_SHADER): self.shader = bytes(to_mv(addr, num * 128))
     elif (typ, block) in ((mesa.ST_CONSTANTS, mesa.SB6_CS_TEX), (mesa.ST6_UAV, mesa.SB6_CS_SHADER)): pass # read through the base registers
     elif (typ, block) == (mesa.ST_SHADER, mesa.SB6_CS_TEX):
+      self.samplers = []
       for k in range(num):
         s = to_mv(addr + k * 16, 16).cast("I")
         wrap = [field(s[0], f"A6XX_TEX_SAMP_0_WRAP_{c}") for c in "STR"]
-        if wrap != [mesa.A6XX_TEX_CLAMP_TO_BORDER] * 3 or s[0] & 0x1e or not s[1] & mesa.A6XX_TEX_SAMP_1_UNNORM_COORDS:
-          raise RuntimeError(f"unsupported sampler {s[0]:#x} {s[1]:#x}")
+        self.samplers.append(wrap == [mesa.A6XX_TEX_CLAMP_TO_BORDER] * 3 and not s[0] & 0x1e and bool(s[1] & mesa.A6XX_TEX_SAMP_1_UNNORM_COORDS))
     else: raise RuntimeError(f"unsupported load state {d[0]:#x}")
 
   def _reg64(self, r:int) -> int: return u64(self.regs[r], self.regs[r + 1])
@@ -115,4 +115,4 @@ class QCOMGPU:
     ibos = self._images(self._reg64(mesa.REG_A6XX_SP_CS_UAV_BASE), nuav, tex=False) if nuav else []
     emu.run(emu.Dispatch(self.shader, self.consts, local, tuple(groups), field(cfg, "A6XX_SP_CS_CONST_CONFIG_0_LOCALIDREGID"),
                          field(cfg, "A6XX_SP_CS_CONST_CONFIG_0_WGIDCONSTID"), lmem_size, pvt_size, list(self.mappings.values()),
-                         textures, ibos, demote))
+                         textures, ibos, demote, self.samplers))

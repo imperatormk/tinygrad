@@ -186,7 +186,7 @@ class Image: addr:int; width:int; height:int; pitch:int; dtype:np.dtype # noqa: 
 @dataclass(frozen=True)
 class Dispatch:
   image:bytes; consts:np.ndarray; local_size:tuple[int, ...]; groups:tuple[int, ...]; localid_reg:int; wgid_reg:int # noqa: E702
-  lmem_size:int; pvt_size:int; ranges:list[tuple[int, int]]; textures:list[Image]; ibos:list[Image]; demote:bool # noqa: E702
+  lmem_size:int; pvt_size:int; ranges:list[tuple[int, int]]; textures:list[Image]; ibos:list[Image]; demote:bool; samplers:list[bool] # noqa: E702
 
 class Threads:
   def __init__(self, d:Dispatch, n:int):
@@ -264,7 +264,8 @@ CAT3:dict[int, tuple[str, Callable]] = {
   mesa.OPC_MAD_F16: ("f", lambda a, b, c: ftz(a * b) + c), mesa.OPC_MAD_F32: ("f", lambda a, b, c: ftz(a * b) + c), # unfused, product flushed
   mesa.OPC_SEL_B16: ("u", lambda a, b, c: np.where(b != 0, a, c)), mesa.OPC_SEL_B32: ("u", lambda a, b, c: np.where(b != 0, a, c)),
   mesa.OPC_SHRM: ("u", lambda a, b, c: (b >> shamt(b, a)) & c), mesa.OPC_SHRG: ("u", lambda a, b, c: (b >> shamt(b, a)) | c),
-  mesa.OPC_SHLG: ("u", lambda a, b, c: (b << shamt(b, a)) | c), mesa.OPC_ANDG: ("u", lambda a, b, c: (b & a) | c),
+  mesa.OPC_SHLG: ("u", lambda a, b, c: (b << shamt(b, a)) | c),
+  mesa.OPC_SHLM: ("u", lambda a, b, c: (b << shamt(b, a)) & c), mesa.OPC_ANDG: ("u", lambda a, b, c: (b & a) | c),
   mesa.OPC_SAD_S32: ("i", lambda a, b, c: a + b + c)}
 CAT4:dict[int, Callable] = {mesa.OPC_RCP: np.reciprocal, mesa.OPC_RSQ: lambda x: 1 / np.sqrt(x), mesa.OPC_LOG2: np.log2,
   mesa.OPC_EXP2: np.exp2, mesa.OPC_SIN: np.sin, mesa.OPC_SQRT: np.sqrt, mesa.OPC_HRSQ: lambda x: 1 / np.sqrt(x), mesa.OPC_HLOG2: np.log2,
@@ -356,6 +357,7 @@ def exec_isam(t:Threads, i:Cat5, k:int): # out of bounds reads the zero border c
     if len(idx := np.unique(t.h[i.src3][t.mask])) != 1: raise i.error()
     tex = int(idx[0])
   if tex >= len(t.d.textures): raise RuntimeError(f"pc {i.pc}: texture {tex} is not bound")
+  if not i.s2en and (i.samp >= len(t.d.samplers) or not t.d.samplers[i.samp]): raise RuntimeError(f"pc {i.pc}: unsupported sampler {i.samp}")
   img, dt = t.d.textures[tex], TYPES[i.type]
   mem, ok, off = texels(img, t.r[i.src1], t.r[i.src1 + 1])
   for n, c in enumerate(c for c in range(4) if i.wrmask >> c & 1):
