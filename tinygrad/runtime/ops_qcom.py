@@ -233,8 +233,8 @@ class QCOMProgramData:
     else: self._parse_lib(obj.lib)
 
     self.pvtmem_size_per_item: int = round_up(self.pvtmem, 512) >> 9
-    self.pvtmem_size_total: int = self.pvtmem_size_per_item * 128 * 2
-    self.hw_stack_offset: int = round_up(next_power2(round_up(self.pvtmem, 512)) * 128 * 16, 0x1000)
+    self.pvtmem_size_total: int = self.pvtmem_size_per_item * dev.fibers_per_sp // 8
+    self.hw_stack_offset: int = round_up(next_power2(round_up(self.pvtmem, 512)) * dev.fibers_per_sp, 0x1000)
     self.shared_size: int = max(1, (self.shmem - 1) // 1024)
     self.max_threads = min(1024, ((384 * 32) // (max(1, (self.fregs + round_up(self.hregs, 2) // 2)) * 128)) * 128)
     self.kernargs_alloc_size = round_up(2048 + (self.tex_cnt + self.ibo_cnt) * 0x40 + len(self.samplers) * 4, 0x100)
@@ -327,6 +327,9 @@ class QCOMDevice(Compiled):
     info = kgsl.struct_kgsl_devinfo()
     kgsl.IOCTL_KGSL_DEVICE_GETPROPERTY(self.fd, type=kgsl.KGSL_PROP_DEVICE_INFO, value=ctypes.addressof(info), sizebytes=ctypes.sizeof(info))
     self.gpu_id = (info.chip_id >> 24, (info.chip_id >> 16) & 0xFF, (info.chip_id >> 8) & 0xFF)
+    # private memory is laid out per fiber: the a640 has 4x the fibers of the a630
+    dev_id = mesa.struct_fd_dev_id(self.gpu_id[0] * 100 + self.gpu_id[1] * 10 + self.gpu_id[2], info.chip_id)
+    self.fibers_per_sp = mesa.fd_dev_info(dev_id).fibers_per_sp or 128 * 16
 
     # a7xx start with 730x or 'Cxxx', a8xx starts 'Exxx'
     if self.gpu_id[:2] >= (7, 3): raise RuntimeError(f"Unsupported GPU: chip_id={info.chip_id:#x}")
