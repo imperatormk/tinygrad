@@ -242,9 +242,10 @@ class Threads:
     if mask is self.everyone: (self.h if half else self.r)[regid] = v
     else: (self.h if half else self.r)[regid, mask] = v[mask]
 
-def clz(v): # clz.b(0) is ~0
-  b = np.unpackbits(v.astype(f"<u{v.dtype.itemsize}").view(np.uint8).reshape(len(v), -1), axis=1, bitorder="little")[:, ::-1]
-  return np.where(b.any(axis=1), b.argmax(axis=1), -1).astype(v.dtype)
+def bits(v): return np.unpackbits(v.astype(f"<u{v.dtype.itemsize}").view(np.uint8).reshape(len(v), -1), axis=1, bitorder="little")
+def first_set(b, v): return np.where(b.any(axis=1), b.argmax(axis=1), -1).astype(v.dtype)
+def clz(v): return first_set(bits(v)[:, ::-1], v)
+def ctz(v): return first_set(bits(v), v)
 def fmin(a, b): # -0 below +0, numpy's fmin only does that on some cpus
   return np.where((a == 0) & (b == 0), np.where(np.signbit(a) | np.signbit(b), -np.abs(a), np.abs(a)), np.fmin(a, b))
 def fmax(a, b):
@@ -259,7 +260,8 @@ def shamt(a, b): return b & b.dtype.type(8 * a.dtype.itemsize - 1)
 COND = [np.less, np.less_equal, np.greater, np.greater_equal, np.equal, np.not_equal]
 CMPS = {mesa.OPC_CMPS_F: "f", mesa.OPC_CMPS_U: "u", mesa.OPC_CMPS_S: "i", mesa.OPC_CMPV_F: "f", mesa.OPC_CMPV_U: "u", mesa.OPC_CMPV_S: "i"}
 CMPV = {mesa.OPC_CMPV_F, mesa.OPC_CMPV_U, mesa.OPC_CMPV_S}
-CAT2_1SRC = {mesa.OPC_SIGN_F, mesa.OPC_ABSNEG_F, mesa.OPC_FLOOR_F, mesa.OPC_TRUNC_F, mesa.OPC_ABSNEG_S, mesa.OPC_NOT_B, mesa.OPC_CLZ_B}
+CAT2_1SRC = {mesa.OPC_SIGN_F, mesa.OPC_ABSNEG_F, mesa.OPC_FLOOR_F, mesa.OPC_TRUNC_F, mesa.OPC_ABSNEG_S, mesa.OPC_NOT_B, mesa.OPC_CLZ_B,
+             mesa.OPC_SETRM}
 BITWISE = {mesa.OPC_AND_B, mesa.OPC_OR_B, mesa.OPC_XOR_B, mesa.OPC_NOT_B}
 CAT0 = {mesa.OPC_NOP, mesa.OPC_END, mesa.OPC_JUMP, mesa.OPC_CALL, mesa.OPC_RET, mesa.OPC_BR, mesa.OPC_BRAO, mesa.OPC_BRAA,
         mesa.OPC_PREDT, mesa.OPC_PREDF, mesa.OPC_PREDE}
@@ -273,7 +275,7 @@ CAT2:dict[int, tuple[str, Callable]] = {
   mesa.OPC_AND_B: ("u", np.bitwise_and), mesa.OPC_OR_B: ("u", np.bitwise_or), mesa.OPC_NOT_B: ("u", np.invert),
   mesa.OPC_XOR_B: ("u", np.bitwise_xor), mesa.OPC_MUL_S24: ("u", lambda a, b: s24(a) * s24(b)),
   mesa.OPC_MUL_U24: ("u", lambda a, b: lo(a.astype(np.uint32), 24) * lo(b.astype(np.uint32), 24)),
-  mesa.OPC_MULL_U: ("u", lambda a, b: lo(a, 16) * lo(b, 16)), mesa.OPC_CLZ_B: ("u", clz),
+  mesa.OPC_MULL_U: ("u", lambda a, b: lo(a, 16) * lo(b, 16)), mesa.OPC_CLZ_B: ("u", clz), mesa.OPC_SETRM: ("u", ctz),
   mesa.OPC_SHL_B: ("u", lambda a, b: a << shamt(a, b)), mesa.OPC_SHR_B: ("u", lambda a, b: a >> shamt(a, b)),
   mesa.OPC_ASHR_B: ("i", lambda a, b: a >> shamt(a, b)), mesa.OPC_GETBIT_B: ("u", lambda a, b: (a >> shamt(a, b)) & a.dtype.type(1))}
 CAT3_HALF = {mesa.OPC_MAD_F16, mesa.OPC_SEL_B16, mesa.OPC_SEL_S16}
