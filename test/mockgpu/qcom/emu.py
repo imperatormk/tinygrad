@@ -8,7 +8,7 @@ from tinygrad.runtime.autogen import mesa
 NREGS = 64 * 4 # regid = gpr*4 + component
 A0, P0 = 61 * 4, 62 * 4 # a0 and p0 live in the full register file
 TYPES = [np.dtype(t) for t in ("f2", "f4", "u2", "u4", "i2", "i4", "u1", "u1")] # last is u8_32
-HALF_TYPES = (0, 2, 4, 6)
+HALF_TYPES = (0, 2, 4, 6, 7)
 FLUT = [0.0, 0.5, 1.0, 2.0, math.e, math.pi, 1/math.pi, 1/math.log2(math.e), math.log2(math.e), 1/math.log2(10), math.log2(10), 4.0]
 
 def view(kind:str, half:bool) -> np.dtype: return np.dtype(f"{kind}{2 if half else 4}")
@@ -66,7 +66,7 @@ class Cat1(Inst):
       self.srcs, self.dsts = [Src("r", getbits(word, 0, 7), half), Src("r", getbits(word, 8, 15), half)], [self.dst, getbits(word, 16, 23)]
       return
     self.op = mesa.OPC_MOV
-    if self.dst_rel or self.multi or self.src_mode == 0b11 or self.round: raise self.error()
+    if self.dst_rel or self.multi or self.src_mode == 0b11 or self.round > 1: raise self.error()
     self.srcs = [Src("r", getbits(word, 0, 7), half, r=bool(self.src_r)) if self.src_mode == 0b00 else
                  Src("c", getbits(word, 0, 10), half, r=bool(self.src_r)) if self.src_mode == 0b01 else Src("i", getbits(word, 0, 31), half)]
 
@@ -121,17 +121,24 @@ class Store(Inst):
     super().__init__(pc, word)
     self.offset = sext(self.off_hi << 8 | self.off_lo, 13) if self.dst_off else 0
 
+def reg_offset(i:Load|Store, word:int, src2:int) -> tuple[int, int, int]: # ldg.a/stg.a: addr + (((src2 << shift) + off) << type shift)
+  if getbits(word, 11, 11): raise i.error()
+  i.offset = 0
+  return src2, getbits(word, 12, 13), getbits(word, 9, 10)
+
 class Ldg(Load):
   size = Field(24, 26)
   def __init__(self, pc:int, word:int):
     super().__init__(pc, word)
-    if not getbits(word, 0, 0) or getbits(word, 22, 22) or getbits(word, 52, 53): raise self.error()
+    if not getbits(word, 0, 0) or getbits(word, 52, 53): raise self.error()
+    self.reg_off = reg_offset(self, word, getbits(word, 1, 8)) if getbits(word, 22, 22) else None
 
 class Stg(Store):
   size = Field(24, 26)
   def __init__(self, pc:int, word:int):
     super().__init__(pc, word)
-    if not getbits(word, 23, 23): raise self.error()
+    if not getbits(word, 23, 23) or getbits(word, 53, 53): raise self.error()
+    self.reg_off = reg_offset(self, word, self.off_lo) if getbits(word, 52, 52) else None
 
 class Ibo(Inst):
   mode, bindless, d_minus_one, typed, type_size_minus_one, opc = Field(6, 7), Field(8), Field(9, 10), Field(11), Field(12, 13), Field(14, 19)
@@ -143,10 +150,9 @@ class Ibo(Inst):
       raise self.error()
 
 class Cat7(Inst):
-  barrier = Field(49)
   def __init__(self, pc:int, word:int):
     super().__init__(pc, word)
-    if not self.barrier or self.op != mesa.OPC_BAR: raise self.error()
+    if self.op not in (mesa.OPC_BAR, mesa.OPC_FENCE): raise self.error() # the closed compiler's bar leaves bit 49 clear
 
 CATS = {0: Cat0, 1: Cat1, 2: Cat2, 3: Cat3, 4: Cat4, 5: Cat5, 7: Cat7}
 CAT6 = {mesa.OPC_LDG: Ldg, mesa.OPC_STG: Stg, mesa.OPC_LDL: Load, mesa.OPC_LDP: Load, mesa.OPC_STL: Store, mesa.OPC_STP: Store}
@@ -180,7 +186,7 @@ class Image: addr:int; width:int; height:int; pitch:int; dtype:np.dtype # noqa: 
 @dataclass(frozen=True)
 class Dispatch:
   image:bytes; consts:np.ndarray; local_size:tuple[int, ...]; groups:tuple[int, ...]; localid_reg:int; wgid_reg:int # noqa: E702
-  lmem_size:int; pvt_size:int; ranges:list[tuple[int, int]]; textures:list[Image]; ibos:list[Image] # noqa: E702
+  lmem_size:int; pvt_size:int; ranges:list[tuple[int, int]]; textures:list[Image]; ibos:list[Image]; demote:bool # noqa: E702
 
 class Threads:
   def __init__(self, d:Dispatch, n:int):
@@ -200,8 +206,9 @@ class Threads:
       raw = (self.h if s.half and s.val < A0 else self.r)[s.val]
       if s.half and raw.dtype == np.uint32: raw = raw.astype(np.uint16)
     else:
-      v = int(self.d.consts[s.val]) if s.kind == "c" else s.val & 0xFFFFFFFF
-      if s.kind == "c" and s.half and dt == np.float16: # SP_MODE_CNTL.CONSTANT_DEMOTION_ENABLE: half float ops convert f32 consts
+      if s.kind == "c": v = int(self.d.consts[s.val] if self.d.demote or not s.half else self.d.consts.view(np.uint16)[s.val])
+      else: v = s.val & 0xFFFFFFFF
+      if s.kind == "c" and s.half and dt == np.float16 and self.d.demote: # SP_MODE_CNTL.CONSTANT_DEMOTION_ENABLE: half float ops convert f32 consts
         v = int(np.uint32(v).view(np.float32).astype(np.float16).view(np.uint16))
       raw = np.full(self.mask.shape, v & 0xFFFF if s.half else v, view("u", s.half))
     v = raw.view(dt) if raw.dtype.itemsize == dt.itemsize else raw.astype(dt)
@@ -231,7 +238,8 @@ def s24(v): return (v.astype(np.int32) << 8) >> 8
 def shamt(a, b): return b & b.dtype.type(8 * a.dtype.itemsize - 1)
 
 COND = [np.less, np.less_equal, np.greater, np.greater_equal, np.equal, np.not_equal]
-CMPS = {mesa.OPC_CMPS_F: "f", mesa.OPC_CMPS_U: "u", mesa.OPC_CMPS_S: "i"}
+CMPS = {mesa.OPC_CMPS_F: "f", mesa.OPC_CMPS_U: "u", mesa.OPC_CMPS_S: "i", mesa.OPC_CMPV_F: "f", mesa.OPC_CMPV_U: "u", mesa.OPC_CMPV_S: "i"}
+CMPV = {mesa.OPC_CMPV_F, mesa.OPC_CMPV_U, mesa.OPC_CMPV_S}
 CAT2_1SRC = {mesa.OPC_SIGN_F, mesa.OPC_ABSNEG_F, mesa.OPC_FLOOR_F, mesa.OPC_TRUNC_F, mesa.OPC_ABSNEG_S, mesa.OPC_NOT_B, mesa.OPC_CLZ_B}
 BITWISE = {mesa.OPC_AND_B, mesa.OPC_OR_B, mesa.OPC_XOR_B, mesa.OPC_NOT_B}
 CAT0 = {mesa.OPC_NOP, mesa.OPC_END, mesa.OPC_JUMP, mesa.OPC_BR, mesa.OPC_BRAO, mesa.OPC_BRAA, mesa.OPC_PREDT, mesa.OPC_PREDF, mesa.OPC_PREDE}
@@ -239,27 +247,32 @@ CAT0 = {mesa.OPC_NOP, mesa.OPC_END, mesa.OPC_JUMP, mesa.OPC_BR, mesa.OPC_BRAO, m
 CAT2:dict[int, tuple[str, Callable]] = {
   mesa.OPC_ADD_F: ("f", np.add), mesa.OPC_MIN_F: ("f", fmin), mesa.OPC_MAX_F: ("f", fmax), mesa.OPC_MUL_F: ("f", np.multiply),
   mesa.OPC_SIGN_F: ("f", sign), mesa.OPC_ABSNEG_F: ("f", np.positive), mesa.OPC_FLOOR_F: ("f", np.floor), mesa.OPC_TRUNC_F: ("f", np.trunc),
-  mesa.OPC_ADD_U: ("u", np.add), mesa.OPC_SUB_U: ("u", np.subtract), mesa.OPC_MIN_U: ("u", np.minimum), mesa.OPC_MIN_S: ("i", np.minimum),
+  mesa.OPC_ADD_U: ("u", np.add), mesa.OPC_ADD_S: ("i", np.add), mesa.OPC_SUB_U: ("u", np.subtract), mesa.OPC_SUB_S: ("i", np.subtract),
+  mesa.OPC_MIN_U: ("u", np.minimum), mesa.OPC_MIN_S: ("i", np.minimum),
   mesa.OPC_MAX_U: ("u", np.maximum), mesa.OPC_MAX_S: ("i", np.maximum), mesa.OPC_ABSNEG_S: ("i", np.positive),
   mesa.OPC_AND_B: ("u", np.bitwise_and), mesa.OPC_OR_B: ("u", np.bitwise_or), mesa.OPC_NOT_B: ("u", np.invert),
   mesa.OPC_XOR_B: ("u", np.bitwise_xor), mesa.OPC_MUL_S24: ("u", lambda a, b: s24(a) * s24(b)),
+  mesa.OPC_MUL_U24: ("u", lambda a, b: lo(a.astype(np.uint32), 24) * lo(b.astype(np.uint32), 24)),
   mesa.OPC_MULL_U: ("u", lambda a, b: lo(a, 16) * lo(b, 16)), mesa.OPC_CLZ_B: ("u", clz),
   mesa.OPC_SHL_B: ("u", lambda a, b: a << shamt(a, b)), mesa.OPC_SHR_B: ("u", lambda a, b: a >> shamt(a, b)),
-  mesa.OPC_ASHR_B: ("i", lambda a, b: a >> shamt(a, b))}
+  mesa.OPC_ASHR_B: ("i", lambda a, b: a >> shamt(a, b)), mesa.OPC_GETBIT_B: ("u", lambda a, b: (a >> shamt(a, b)) & a.dtype.type(1))}
 CAT3_HALF = {mesa.OPC_MAD_F16, mesa.OPC_SEL_B16}
 CAT3:dict[int, tuple[str, Callable]] = {
   mesa.OPC_MADSH_M16: ("u", lambda a, b, c: (lo(a, 16) * (b >> 16) << 16) + c), # lo(src1) * hi(src2)
+  mesa.OPC_MADSH_U16: ("u", lambda a, b, c: (lo(a, 16) * (b >> 16) << 16) + c), mesa.OPC_MAD_S24: ("u", lambda a, b, c: s24(a) * s24(b) + c),
+  mesa.OPC_SEL_S32: ("i", lambda a, b, c: np.where(b >= 0, a, c)), mesa.OPC_SEL_F32: ("f", lambda a, b, c: np.where(b >= 0, a, c)),
   mesa.OPC_MAD_F16: ("f", lambda a, b, c: ftz(a * b) + c), mesa.OPC_MAD_F32: ("f", lambda a, b, c: ftz(a * b) + c), # unfused, product flushed
   mesa.OPC_SEL_B16: ("u", lambda a, b, c: np.where(b != 0, a, c)), mesa.OPC_SEL_B32: ("u", lambda a, b, c: np.where(b != 0, a, c)),
-  mesa.OPC_SHRM: ("u", lambda a, b, c: (b >> a) & c), mesa.OPC_SHRG: ("u", lambda a, b, c: (b >> a) | c),
-  mesa.OPC_SHLG: ("u", lambda a, b, c: (b << a) | c), mesa.OPC_ANDG: ("u", lambda a, b, c: (b & a) | c)}
+  mesa.OPC_SHRM: ("u", lambda a, b, c: (b >> shamt(b, a)) & c), mesa.OPC_SHRG: ("u", lambda a, b, c: (b >> shamt(b, a)) | c),
+  mesa.OPC_SHLG: ("u", lambda a, b, c: (b << shamt(b, a)) | c), mesa.OPC_ANDG: ("u", lambda a, b, c: (b & a) | c),
+  mesa.OPC_SAD_S32: ("i", lambda a, b, c: a + b + c)}
 CAT4:dict[int, Callable] = {mesa.OPC_RCP: np.reciprocal, mesa.OPC_RSQ: lambda x: 1 / np.sqrt(x), mesa.OPC_LOG2: np.log2,
   mesa.OPC_EXP2: np.exp2, mesa.OPC_SIN: np.sin, mesa.OPC_SQRT: np.sqrt, mesa.OPC_HRSQ: lambda x: 1 / np.sqrt(x), mesa.OPC_HLOG2: np.log2,
   mesa.OPC_HEXP2: np.exp2}
 
-def cov_to_float(v, dt): # round mode 0 is toward zero; f16 overflow saturates
+def cov_to_float(v, dt, even=False): # round mode 0 is toward zero, f16 overflow saturates; 1 is (even)
   with np.errstate(over="ignore"): r = v.astype(dt)
-  r = np.where(np.abs(r.astype(np.float64)) > np.abs(v.astype(np.float64)), np.nextafter(r, dt.type(0)), r).astype(dt)
+  if not even: r = np.where(np.abs(r.astype(np.float64)) > np.abs(v.astype(np.float64)), np.nextafter(r, dt.type(0)), r).astype(dt)
   return np.where(np.abs(r) < np.finfo(dt).tiny, np.copysign(dt.type(0), r), r) if dt == np.float16 else r
 
 def exec_mov(t:Threads, i:Cat1, k:int):
@@ -272,7 +285,7 @@ def exec_mov(t:Threads, i:Cat1, k:int):
   if i.src_type in (6, 7): v = v.view(np.int8) # cov from u8 sign-extends
   if v.dtype.kind == "f" and dst_dt.kind != "f":
     v = np.clip(np.trunc(np.nan_to_num(v.astype(np.float64))), np.iinfo(dst_dt).min, np.iinfo(dst_dt).max)
-  elif dst_dt.kind == "f" and v.dtype != dst_dt: v = cov_to_float(v, dst_dt)
+  elif dst_dt.kind == "f" and v.dtype != dst_dt: v = cov_to_float(v, dst_dt, even=i.round == 1)
   t.write(i.dst + k, i.dst_type in HALF_TYPES, v.astype(dst_dt))
 
 def ftz(v): # float alu flushes denormal sources and results, cov doesn't
@@ -285,6 +298,7 @@ def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
   srcs = [s.at(k) for s in i.srcs]
   if isinstance(i, Cat2) and i.op in CMPS:
     out = COND[i.cond](*[ftz(t.read(s, view(CMPS[i.op], s.half))) for s in srcs]).astype(view("u", srcs[0].half))
+    if i.op in CMPV: out = -out
   elif isinstance(i, Cat4): # computed in f64 since numpy's f32 results vary by cpu, half results are truncated
     x = ftz(t.read(srcs[0], view("f", srcs[0].half)))
     out = CAT4[i.op](x.astype(np.float64)).astype(np.float32)
@@ -294,12 +308,15 @@ def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
   else:
     kind, fn = (CAT2 if isinstance(i, Cat2) else CAT3)[i.op]
     out = fn(*[ftz(t.read(s, view(kind, s.half))) for s in srcs])
-  out = canonical_nan(ftz(out))
+  out = ftz(out) if i.op == mesa.OPC_SEL_F32 else canonical_nan(ftz(out))
   if i.sat and out.dtype.kind != "f": raise i.error()
   t.write(i.dst + k, i.dst_half, np.clip(out, 0, 1) if i.sat else out)
 
 def global_lanes(t:Threads, i:Ldg|Stg, nbytes:int) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
   addrs = (t.r[i.addr].astype(np.uint64) | (t.r[i.addr + 1].astype(np.uint64) << np.uint64(32))) + np.uint64(i.offset & (2**64 - 1))
+  if i.reg_off is not None:
+    src2, shift, off = i.reg_off
+    addrs += ((t.r[src2].astype(np.uint64) << np.uint64(shift)) + np.uint64(off)) << np.uint64(0 if i.type >= 6 else 1 if i.type in HALF_TYPES else 2)
   which = np.searchsorted(t.starts, addrs, side="right").astype(np.int64) - 1
   if (bad := t.mask & ((which < 0) | (addrs + np.uint64(nbytes) > t.ends[np.maximum(which, 0)]))).any():
     raise RuntimeError(f"pc {i.pc}: out of bounds global access at {int(addrs[np.argmax(bad)]):#x}")
