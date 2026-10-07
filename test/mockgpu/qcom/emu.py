@@ -7,7 +7,7 @@ from tinygrad.runtime.autogen import mesa
 
 NREGS = 64 * 4 # regid = gpr*4 + component
 A0, P0 = 61 * 4, 62 * 4 # a0 and p0 live in the full register file
-TYPES = [np.dtype(t) for t in ("f2", "f4", "u2", "u4", "i2", "i4", "u1", "u1")] # last is u8_32
+TYPES = [np.dtype(t) for t in ("f2", "f4", "u2", "u4", "i2", "i4", "u1", "i1")] # last is u8_32, it sign-extends
 HALF_TYPES = (0, 2, 4, 6, 7)
 FLUT = [0.0, 0.5, 1.0, 2.0, math.e, math.pi, 1/math.pi, 1/math.log2(math.e), math.log2(math.e), 1/math.log2(10), math.log2(10), 4.0]
 
@@ -26,7 +26,7 @@ class Src:
 def multisrc(x:int, half:bool, r:int) -> Src:
   absneg = getbits(x, 14, 15)
   if getbits(x, 11, 13) == 0b000: return Src("r", getbits(x, 0, 7), half, absneg, bool(r))
-  if getbits(x, 10, 13) == 0b0011 and not half: return Src("c<", sext(getbits(x, 0, 9), 10), half, absneg) # c<a0.x + off>
+  if getbits(x, 10, 13) == 0b0011 and not half: return Src("c<", sext(getbits(x, 0, 9), 10), half, absneg)
   if getbits(x, 11, 12) == 0b10: return Src("c", getbits(x, 0, 10), half, absneg, bool(r))
   if getbits(x, 11, 13) == 0b100: return Src("i", sext(getbits(x, 0, 10), 11), half, absneg)
   if getbits(x, 11, 13) == 0b101:
@@ -70,13 +70,17 @@ class Cat1(Inst):
     if self.dst_rel or self.multi or self.src_mode == 0b11 or self.round > 1: raise self.error()
     self.srcs = [Src("r", getbits(word, 0, 7), half, r=bool(self.src_r)) if self.src_mode == 0b00 else
                  Src("c", getbits(word, 0, 10), half, r=bool(self.src_r)) if self.src_mode == 0b01 else Src("i", getbits(word, 0, 31), half)]
+    if self.src_mode == 0b00 and getbits(word, 11, 11):
+      if not getbits(word, 10, 10) or half: raise self.error()
+      self.srcs = [Src("c<", sext(getbits(word, 0, 9), 10))]
 
 class Cat2(Inst):
-  dst, repeat, sat, src1_r, dst_conv = Field(32, 39), Field(40, 41), Field(42), Field(43), Field(46)
+  dst, repeat, sat, src1_r, dst_conv, ei = Field(32, 39), Field(40, 41), Field(42), Field(43), Field(46), Field(47)
   cond, src2_r, full, opc = Field(48, 50), Field(51), Field(52), Field(53, 58)
   def __init__(self, pc:int, word:int):
     super().__init__(pc, word)
     if self.op not in CAT2 and (self.op not in CMPS or self.cond >= len(COND)): raise self.error()
+    if self.ei and (self.op != mesa.OPC_ADD_U or not self.full): raise self.error()
     self.dst_half = (not self.full) ^ bool(self.dst_conv)
     self.srcs = [multisrc(getbits(word, 0, 15), not self.full, self.src1_r)]
     if self.op not in CAT2_1SRC: self.srcs.append(multisrc(getbits(word, 16, 31), not self.full, self.src2_r))
@@ -91,6 +95,7 @@ class Cat3(Inst):
     if self.op not in CAT3: raise self.error()
     half = not self.sat_full if self.alt else self.op in CAT3_HALF
     self.sat, self.dst_half = 0 if self.alt else self.sat_full, half ^ bool(self.dst_conv)
+    if self.op == mesa.OPC_MAD_U16: self.dst_half = not self.dst_conv
     self.srcs = [cat3src(self.src1, half, self.alt, self.src1_r, self.src1_neg), Src("r", self.src2, half, self.src2_neg, bool(self.src2_r)),
                  cat3src(self.src3, half, self.alt, self.src3_r, self.src3_neg)]
 
@@ -122,7 +127,7 @@ class Store(Inst):
     super().__init__(pc, word)
     self.offset = sext(self.off_hi << 8 | self.off_lo, 13) if self.dst_off else 0
 
-def reg_offset(i:Load|Store, word:int, src2:int) -> tuple[int, int, int]: # ldg.a/stg.a: addr + (((src2 << shift) + off) << type shift)
+def reg_offset(i:Load|Store, word:int, src2:int) -> tuple[int, int, int]:
   if getbits(word, 11, 11): raise i.error()
   i.offset = 0
   return src2, getbits(word, 12, 13), getbits(word, 9, 10)
@@ -313,6 +318,7 @@ def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
   srcs = [s.at(k) for s in i.srcs]
   if isinstance(i, Cat2) and i.op in CMPS:
     out = COND[i.cond](*[ftz(t.read(s, view(CMPS[i.op], s.half))) for s in srcs]).astype(view("u", srcs[0].half))
+    if i.sat: out = out ^ out.dtype.type(1)
     if i.op in CMPV: out = -out
   elif isinstance(i, Cat4): # computed in f64 since numpy's f32 results vary by cpu, half results are truncated
     x = ftz(t.read(srcs[0], view("f", srcs[0].half)))
@@ -323,6 +329,8 @@ def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
   else:
     kind, fn = (CAT2 if isinstance(i, Cat2) else CAT3)[i.op]
     out = fn(*[ftz(t.read(s, view(kind, s.half))) for s in srcs])
+    if isinstance(i, Cat2) and i.ei: # the 33-bit sum >> 1
+      out = ((t.read(srcs[0], np.dtype(np.uint32)).astype(np.uint64) + t.read(srcs[1], np.dtype(np.uint32))) >> np.uint64(1)).astype(np.uint32)
   out = ftz(out) if i.op == mesa.OPC_SEL_F32 else canonical_nan(ftz(out))
   sat = i.sat and not (isinstance(i, Cat2) and i.op in CMPS)
   if sat and out.dtype.kind != "f": raise i.error()
@@ -409,7 +417,7 @@ def run(d:Dispatch):
   for reg, v, dims in [(d.localid_reg, lid, d.local_size), (d.wgid_reg, gid, d.groups)]:
     if reg != 0xfc: t.r[reg], t.r[reg + 1], t.r[reg + 2] = v % dims[0], (v // dims[0]) % dims[1], v // (dims[0] * dims[1])
   pc, done, blocked = np.zeros(len(tid), np.int64), np.zeros(len(tid), bool), np.zeros(len(tid), bool)
-  calls, depth = np.zeros((16, len(tid)), np.int64), np.zeros(len(tid), np.int64) # return addresses per thread
+  calls, depth = np.zeros((16, len(tid)), np.int64), np.zeros(len(tid), np.int64)
   together:int|None = d.entry # pc while nothing has diverged
   with np.errstate(all="ignore"):
     while not done.all():
