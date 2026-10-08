@@ -7,7 +7,7 @@ on:
         description: Compilation workers (0 for serial)
         type: choice
         options: ['0', '2', '4']
-        default: '2'
+        default: '0'
   # Temporary experiment: also bootstraps the workflow on the feature branch.
   push:
     branches: [qcom-a630-model-perf]
@@ -29,10 +29,12 @@ jobs:
       CACHE_VERSION: '20'
       PYTHONPATH: ${{ github.workspace }}
       PYTHONFAULTHANDLER: 1
+      PYTHONUNBUFFERED: 1
       CHECK_OOB: 1
       CCACHE: 0
       DEV: MOCK+QCOM:${{ matrix.renderer }}
-      PARALLEL: ${{ inputs.parallel || '2' }}
+      # First timing diagnosis uses serial compilation to match the full CL job.
+      PARALLEL: ${{ inputs.parallel || '0' }}
       # Keep the compiler servers alive for this bounded model compilation.
       BEAM_MAX_TASKS_PER_CHILD: 256
       LFS_SHA: '51b12d20a25b76fa8a5717c2e5af01f148e469e2'
@@ -52,7 +54,7 @@ jobs:
             /usr/bin/time -f 'model total: %e s; peak RSS: %M KiB' env VALIDATE_WITH_CPU=1 IMAGE=1 FLOAT16=1 \
               python examples/openpilot/compile_onnx.py \
               "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" \
-              "/tmp/$model.pkl" --benchmark-runs 1 2>&1 | tee "/tmp/$model.log"
+              "/tmp/$model.pkl" --benchmark-runs 1 --timings "/tmp/$model-timings.json" 2>&1 | tee "/tmp/$model.log"
             echo '::endgroup::'
           done
       - uses: actions/upload-artifact@v7
@@ -62,3 +64,5 @@ jobs:
           path: |
             /tmp/dmonitoring_model.log
             /tmp/driving_supercombo.log
+            /tmp/dmonitoring_model-timings.json
+            /tmp/driving_supercombo-timings.json
