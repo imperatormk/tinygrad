@@ -649,7 +649,7 @@ jobs:
             /usr/bin/time -f 'model total: %e s; peak RSS: %M KiB' env IMAGE=1 FLOAT16=1 \
               python examples/openpilot/compile_onnx.py \
               "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" \
-              "/tmp/$model.pkl" --benchmark-runs 1 --timings "/tmp/$model-timings.json" 2>&1 | tee "/tmp/$model.log"
+              "/tmp/$model.pkl" --benchmark-runs 1 2>&1 | tee "/tmp/$model.log"
             echo '::endgroup::'
           done
       - uses: actions/upload-artifact@v7
@@ -659,8 +659,6 @@ jobs:
           path: |
             /tmp/dmonitoring_model.log
             /tmp/driving_supercombo.log
-            /tmp/dmonitoring_model-timings.json
-            /tmp/driving_supercombo-timings.json
       - name: Run process replay tests
         uses: ./.github/actions/process-replay
 
