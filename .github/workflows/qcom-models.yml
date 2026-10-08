@@ -6,8 +6,8 @@ on:
       parallel:
         description: Compilation workers (0 for serial)
         type: choice
-        options: ['0', '2', '4']
-        default: '0'
+        options: ['0', '2', '3', '4']
+        default: '3'
   # Temporary experiment: also bootstraps the workflow on the feature branch.
   push:
     branches: [qcom-a630-model-perf]
@@ -33,8 +33,8 @@ jobs:
       CHECK_OOB: 1
       CCACHE: 0
       DEV: MOCK+QCOM:${{ matrix.renderer }}
-      # First timing diagnosis uses serial compilation to match the full CL job.
-      PARALLEL: ${{ inputs.parallel || '0' }}
+      # Current experiment: compare three workers against the serial and two-worker runs.
+      PARALLEL: ${{ inputs.parallel || '3' }}
       # Keep the compiler servers alive for this bounded model compilation.
       BEAM_MAX_TASKS_PER_CHILD: 256
       LFS_SHA: '51b12d20a25b76fa8a5717c2e5af01f148e469e2'
