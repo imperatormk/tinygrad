@@ -19,7 +19,7 @@ class TestNativeALU(unittest.TestCase):
     words = [alu(emu.mesa.OPC_MAD_F32, repeat=3, modifiers=1), alu(emu.mesa.OPC_MUL_F, dst=1, modifiers=3),
              alu(emu.mesa.OPC_ADD_F, dst=0, a=1, modifiers=2)]
     code = image(*words)
-    block, fn = native.plan(code, 0)[0], native.kernels(code, 0)[0]
+    block, fn = native.plan(code, 0)[0], native.engine()
     rng = np.random.default_rng(51)
     edges = np.array([0, 0x80000000, 1, 0x80000001, 0x7fffff, 0x807fffff, 0x800000, 0x80800000,
                       0x3f800000, 0xbf800000, 0x7f800000, 0xff800000, 0x7f7fffff, 0x7fc00001, 0xff800001], np.uint32)
@@ -44,7 +44,7 @@ class TestNativeALU(unittest.TestCase):
 
   def test_mad_rounding(self):
     code = image(alu(emu.mesa.OPC_MAD_F32, dst=3))
-    block, fn = native.plan(code, 0)[0], native.kernels(code, 0)[0]
+    block, fn = native.plan(code, 0)[0], native.engine()
     n, rng = 65537, np.random.default_rng(72)
     with np.errstate(all='ignore'):
       for mode in ('bits', 'cancellation', 'subnormal_product'):
@@ -84,6 +84,14 @@ class TestNativeALU(unittest.TestCase):
       self.assertFalse(native.supported(emu.decode_inst(0, word)))
     with patch.object(subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'cc')):
       with self.assertRaises(subprocess.CalledProcessError): native.compile_source('/* deliberate compile failure */')
+
+  def test_one_build_for_different_shaders(self):
+    native.engine.cache_clear()
+    native.compile_source.cache_clear()
+    with patch.object(subprocess, 'run', wraps=subprocess.run) as compiler:
+      for op in (emu.mesa.OPC_ADD_F, emu.mesa.OPC_MUL_F, emu.mesa.OPC_MAD_F32):
+        emu.run(dispatch(image(alu(op), emu.mesa.OPC_END << 55), 4))
+      self.assertEqual(compiler.call_count, 1)
 
 
 if __name__ == '__main__': unittest.main()

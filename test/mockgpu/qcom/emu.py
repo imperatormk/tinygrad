@@ -456,7 +456,7 @@ EXEC:dict[type, Callable] = {Cat1: exec_mov, Cat2: exec_alu, Cat3: exec_alu, Cat
                              Stg: exec_mem, Load: exec_mem, Store: exec_mem}
 
 def run(d:Dispatch):
-  from test.mockgpu.qcom.emu_native import plan, kernels
+  from test.mockgpu.qcom.emu_native import plan, engine
   n_local, n_groups = math.prod(d.local_size), math.prod(d.groups)
   tid = np.arange(n_local * n_groups)
   if not len(tid): return
@@ -484,8 +484,8 @@ def run(d:Dispatch):
         t.mask = (pc == cur) & ~done
       if isinstance(i := prog[cur], NotImplementedError): raise i
       if (block := native.get(cur)) is not None:
-        if compiled is None: compiled = kernels(d.image, d.entry)
-        block.execute(t, compiled[cur])
+        if compiled is None: compiled = engine()
+        block.execute(t, compiled)
         if together is not None: together = block.end
         else: pc[t.mask] = block.end
         continue
