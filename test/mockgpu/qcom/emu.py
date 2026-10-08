@@ -44,6 +44,7 @@ def cat3src(x:int, half:bool, immed:int, r:int, neg:int) -> Src:
   raise NotImplementedError(f"cat3 source encoding {x:#x}")
 
 class Inst:
+  repeat_srcs:list[list[Src]]
   cat, opc, repeat = Field(61, 63), Field(55, 58), 0
   def __init__(self, pc:int, word:int):
     self.pc, self.word = pc, word
@@ -172,7 +173,10 @@ def decode_inst(pc:int, word:int) -> Inst:
   if cat == 6 and getbits(word, 52, 53) == 0b10 and getbits(word, 20, 22) == 0b110: return Ibo(pc, word) # bits 54-58 aren't the opcode here
   cls = CAT6.get(6 << 7 | getbits(word, 54, 58)) if cat == 6 else CATS.get(cat)
   if cls is None: raise NotImplementedError(f"pc {pc}: cat{cat} is not emulated {word:#x}")
-  return cls(pc, word)
+  inst = cls(pc, word)
+  if isinstance(inst, (Cat1, Cat2, Cat3, Cat4)):
+    inst.repeat_srcs = [[s.at(k) for s in inst.srcs] for k in range(inst.iterations)]
+  return inst
 
 @functools.cache
 def decode(image:bytes) -> list[Inst|NotImplementedError]: # padding after end may not decode
@@ -308,12 +312,12 @@ def exec_mov(t:Threads, i:Cat1, k:int):
     for d, v in zip(i.dsts, vals): t.write(d, i.dst_type in HALF_TYPES, v)
     return
   src_dt, dst_dt = TYPES[i.src_type], TYPES[i.dst_type]
-  v = t.read(i.srcs[0].at(k), src_dt)
+  v = t.read(i.repeat_srcs[k][0], src_dt)
   if i.src_type in (6, 7): v = v.view(np.int8) # cov from u8 sign-extends
   if v.dtype.kind == "f" and dst_dt.kind != "f":
     v = np.clip(np.trunc(np.nan_to_num(v.astype(np.float64))), np.iinfo(dst_dt).min, np.iinfo(dst_dt).max)
   elif dst_dt.kind == "f" and v.dtype != dst_dt: v = cov_to_float(v, dst_dt, even=i.round == 1)
-  t.write(i.dst + k, i.dst_type in HALF_TYPES, v.astype(dst_dt))
+  t.write(i.dst + k, i.dst_type in HALF_TYPES, v.astype(dst_dt, copy=False))
 
 def ftz(v): # float alu flushes denormal sources and results, cov doesn't
   if v.dtype.kind != "f" or not (mask := np.abs(v) < np.finfo(v.dtype).tiny).any(): return v
@@ -324,7 +328,7 @@ def canonical_nan(v):
   return np.where(mask, v.dtype.type(np.nan), v)
 
 def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
-  srcs = [s.at(k) for s in i.srcs]
+  srcs = i.repeat_srcs[k]
   if isinstance(i, Cat2) and i.op in CMPS:
     out = COND[i.cond](*[ftz(t.read(s, view(CMPS[i.op], s.half))) for s in srcs]).astype(view("u", srcs[0].half))
     if i.sat: out = out ^ out.dtype.type(1)
