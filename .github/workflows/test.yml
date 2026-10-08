@@ -637,10 +637,30 @@ jobs:
       - name: Run TRANSCENDENTAL math
         run: TRANSCENDENTAL=2 python -m pytest -n=auto test/runtime/test_ops.py::TestOps::test_sin test/runtime/test_ops.py::TestOps::test_cos test/runtime/test_ops.py::TestOps::test_tan test/runtime/test_ops.py::TestOps::test_exp test/runtime/test_ops.py::TestOps::test_log --durations=20
       - name: Test openpilot models
+        shell: bash
+        env:
+          PARALLEL: 4
+          BEAM_MAX_TASKS_PER_CHILD: 256
+          CCACHE: 0
+          PYTHONUNBUFFERED: 1
         run: |
           for model in dmonitoring_model driving_supercombo; do
-            VALIDATE_WITH_CPU=1 IMAGE=1 FLOAT16=1 python examples/openpilot/compile_onnx.py "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" /tmp/openpilot.pkl --benchmark-runs 1
+            echo "::group::$model"
+            /usr/bin/time -f 'model total: %e s; peak RSS: %M KiB' env IMAGE=1 FLOAT16=1 \
+              python examples/openpilot/compile_onnx.py \
+              "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" \
+              "/tmp/$model.pkl" --benchmark-runs 1 --timings "/tmp/$model-timings.json" 2>&1 | tee "/tmp/$model.log"
+            echo '::endgroup::'
           done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: qcom-models-${{ matrix.renderer }}
+          path: |
+            /tmp/dmonitoring_model.log
+            /tmp/driving_supercombo.log
+            /tmp/dmonitoring_model-timings.json
+            /tmp/driving_supercombo-timings.json
       - name: Run process replay tests
         uses: ./.github/actions/process-replay
 
