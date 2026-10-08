@@ -1,0 +1,64 @@
+name: QCOM model CPU comparison
+
+on:
+  workflow_dispatch:
+  # Temporary validation on the clean branch before incorporating the check into full CI.
+  push:
+    branches: [qcom-a630-perf-clean]
+    paths: [.github/workflows/qcom-model-cpu.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  models:
+    name: openpilot CPU comparison (${{ matrix.renderer }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        renderer: [IR3, CL]
+    env:
+      CACHE_VERSION: '20'
+      PYTHONPATH: ${{ github.workspace }}
+      PYTHONUNBUFFERED: 1
+      PYTHONFAULTHANDLER: 1
+      CHECK_OOB: 1
+      DEV: MOCK+QCOM:${{ matrix.renderer }}
+      IMAGE: 1
+      FLOAT16: 1
+      BEAM_MAX_TASKS_PER_CHILD: 256
+      LFS_SHA: '51b12d20a25b76fa8a5717c2e5af01f148e469e2'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-tinygrad
+        with:
+          key: qcom-model-cpu-${{ matrix.renderer }}
+          deps: testing_unit mesa
+          pydeps: onnxruntime==1.24.1
+          qemu: ${{ matrix.renderer == 'CL' }}
+      - name: Compile models and compare saved artifacts against CPU
+        shell: bash
+        run: |
+          status=0
+          for model in dmonitoring_model driving_supercombo; do
+            echo "::group::$model"
+            export MODEL_ONNX="https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx"
+            export MODEL_PKL="/tmp/$model.pkl"
+            if ! {
+              /usr/bin/time -f 'target compile and checks: %e s' \
+                python examples/openpilot/compile_onnx.py "$MODEL_ONNX" "$MODEL_PKL" --benchmark-runs 1 &&
+              /usr/bin/time -f 'CPU comparison and saved-target replays: %e s' \
+                python test/external/external_test_compile.py TestCompiledModel.test_onnx -v
+            } 2>&1 | tee "/tmp/$model-cpu.log"; then
+              status=1
+            fi
+            echo '::endgroup::'
+          done
+          exit "$status"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: qcom-model-cpu-${{ matrix.renderer }}
+          path: /tmp/*-cpu.log
