@@ -643,7 +643,7 @@ jobs:
       - name: Test openpilot models
         run: |
           for model in dmonitoring_model driving_supercombo; do
-            IMAGE=1 FLOAT16=1 python examples/openpilot/compile_onnx.py "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" /tmp/openpilot.pkl --benchmark-runs 1
+            VALIDATE_WITH_CPU=1 IMAGE=1 FLOAT16=1 python examples/openpilot/compile_onnx.py "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" /tmp/openpilot.pkl --benchmark-runs 1
           done
       - name: Run process replay tests
         uses: ./.github/actions/process-replay
