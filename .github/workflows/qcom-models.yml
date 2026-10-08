@@ -20,7 +20,7 @@ jobs:
   models:
     name: openpilot (${{ matrix.renderer }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30 # Temporary native-emulator experiment.
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +43,8 @@ jobs:
           key: qcom-model-perf-${{ matrix.renderer }}
           deps: testing_unit mesa
           qemu: ${{ matrix.renderer == 'CL' }}
+      - name: Test native emulator semantics
+        run: python -m pytest test/device/qcom/test_emu_native.py test/device/qcom/test_emu_helpers.py -q -n12
       - name: Test openpilot models
         run: |
           for model in dmonitoring_model driving_supercombo; do
@@ -50,7 +52,7 @@ jobs:
             /usr/bin/time -f 'model total: %e s; peak RSS: %M KiB' env VALIDATE_WITH_CPU=1 IMAGE=1 FLOAT16=1 \
               python examples/openpilot/compile_onnx.py \
               "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" \
-              "/tmp/$model.pkl" --benchmark-runs 3 2>&1 | tee "/tmp/$model.log"
+              "/tmp/$model.pkl" --benchmark-runs 1 2>&1 | tee "/tmp/$model.log"
             echo '::endgroup::'
           done
       - uses: actions/upload-artifact@v7

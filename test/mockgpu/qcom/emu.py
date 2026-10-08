@@ -218,6 +218,9 @@ class Threads:
     self.starts, self.ends = np.array([s for s,_ in self.maps], np.uint64), np.array([s + sz for s,sz in self.maps], np.uint64)
     self.bufs:dict[int, np.ndarray] = {}
     self.mems:dict[int, tuple[np.ndarray, np.ndarray, int]] = {}
+    self.float_clean = [False] * (2 * NREGS) # proof for each full/half register, not for its integer reinterpretation
+    self.float_reads:list[np.ndarray|None] = [None] * (2 * NREGS)
+    self.texture_rows:dict[Image, np.ndarray] = {}
 
   def buf(self, k:int) -> np.ndarray:
     if k not in self.bufs: self.bufs[k] = np.frombuffer(to_mv(*self.maps[k]), np.uint8)
@@ -242,10 +245,30 @@ class Threads:
     if s.absneg & 1: v = -v
     return v
 
-  def write(self, regid:int, half:bool, v:np.ndarray, mask:np.ndarray|None=None):
+  def read_alu(self, s:Src, dt:np.dtype) -> np.ndarray:
+    if dt.kind != "f": return self.read(s, dt)
+    if s.kind != "r" or (s.half and s.val >= A0): return ftz(self.read(s, dt))
+    idx = s.val + NREGS * s.half
+    if (v := self.float_reads[idx]) is None:
+      v = (self.h if s.half else self.r)[s.val].view(dt)
+      self.float_reads[idx] = v = v if self.float_clean[idx] else ftz(v)
+    if s.absneg & 2: v = np.abs(v)
+    if s.absneg & 1: v = -v
+    return v
+
+  def write(self, regid:int, half:bool, v:np.ndarray, mask:np.ndarray|None=None, float_clean:bool=False):
     if regid >= A0: half = False
     if half and v.dtype == np.float32: v = cov_to_float(v, np.dtype(np.float16))
     v, mask = v.astype(view("f" if v.dtype.kind == "f" else "u", half), copy=False).view(view("u", half)), self.mask if mask is None else mask
+    idx = regid + NREGS * half
+    self.float_reads[idx] = None
+    self.float_clean[idx] = float_clean and (mask is self.everyone or self.float_clean[idx])
+    if self.d.merged:
+      if half:
+        self.float_clean[regid // 2], self.float_reads[regid // 2] = False, None
+      elif regid < NREGS // 2:
+        self.float_clean[NREGS + 2*regid] = self.float_clean[NREGS + 2*regid + 1] = False
+        self.float_reads[NREGS + 2*regid] = self.float_reads[NREGS + 2*regid + 1] = None
     if mask is self.everyone: (self.h if half else self.r)[regid] = v
     else: (self.h if half else self.r)[regid, mask] = v[mask]
 
@@ -319,8 +342,11 @@ def exec_mov(t:Threads, i:Cat1, k:int):
   elif dst_dt.kind == "f" and v.dtype != dst_dt: v = cov_to_float(v, dst_dt, even=i.round == 1)
   t.write(i.dst + k, i.dst_type in HALF_TYPES, v.astype(dst_dt, copy=False))
 
+@functools.cache
+def float_tiny(dt:np.dtype): return np.finfo(dt).tiny
+
 def ftz(v): # float alu flushes denormal sources and results, cov doesn't
-  if v.dtype.kind != "f" or not (mask := np.abs(v) < np.finfo(v.dtype).tiny).any(): return v
+  if v.dtype.kind != "f" or not (mask := np.abs(v) < float_tiny(v.dtype)).any(): return v
   return np.where(mask, np.copysign(v.dtype.type(0), v), v)
 
 def canonical_nan(v):
@@ -330,18 +356,18 @@ def canonical_nan(v):
 def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
   srcs = i.repeat_srcs[k]
   if isinstance(i, Cat2) and i.op in CMPS:
-    out = COND[i.cond](*[ftz(t.read(s, view(CMPS[i.op], s.half))) for s in srcs]).astype(view("u", srcs[0].half))
+    out = COND[i.cond](*[t.read_alu(s, view(CMPS[i.op], s.half)) for s in srcs]).astype(view("u", srcs[0].half))
     if i.sat: out = out ^ out.dtype.type(1)
     if i.op in CMPV: out = -out
   elif isinstance(i, Cat4): # computed in f64 since numpy's f32 results vary by cpu, half results are truncated
-    x = ftz(t.read(srcs[0], view("f", srcs[0].half)))
+    x = t.read_alu(srcs[0], view("f", srcs[0].half))
     out = CAT4[i.op](x.astype(np.float64)).astype(np.float32)
     if x.dtype == np.float16: out = cov_to_float(out, np.dtype(np.float16))
   elif i.op in BITWISE: # (neg) is a bitwise not here
     out = CAT2[i.op][1](*[~t.read(replace(s, absneg=0), view("u", s.half)) if s.absneg & 1 else t.read(s, view("u", s.half)) for s in srcs])
   else:
     kind, fn = (CAT2 if isinstance(i, Cat2) else CAT3)[i.op]
-    out = fn(*[ftz(t.read(s, view(kind, s.half))) for s in srcs])
+    out = fn(*[t.read_alu(s, view(kind, s.half)) for s in srcs])
     if isinstance(i, Cat2) and i.ei:
       out = ((t.read(srcs[0], np.dtype(np.uint32)).astype(np.uint64) + t.read(srcs[1], np.dtype(np.uint32))) >> np.uint64(1)).astype(np.uint32)
   out = ftz(out) if i.op == mesa.OPC_SEL_F32 else canonical_nan(ftz(out))
@@ -352,7 +378,7 @@ def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
       out = np.where(a < b, out.dtype.type(0), out)
     elif out.dtype.kind == "f": out = np.clip(out, 0, 1)
     else: raise i.error()
-  t.write(i.dst + k, i.dst_half, out)
+  t.write(i.dst + k, i.dst_half, out, float_clean=out.dtype.kind == "f")
 
 def global_lanes(t:Threads, i:Ldg|Stg, nbytes:int) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
   addrs = (t.r[i.addr].astype(np.uint64) | (t.r[i.addr + 1].astype(np.uint64) << np.uint64(32))) + np.uint64(i.offset & (2**64 - 1))
@@ -408,8 +434,12 @@ def exec_isam(t:Threads, i:Cat5, k:int): # out of bounds reads the zero border c
   mem, ok, off = texels(img, t.r[i.src1], t.r[i.src1 + 1])
   channels = [c for c in range(4) if i.wrmask >> c & 1]
   if not channels: return
-  values = mem.view(img.dtype)[off[:, None] // img.dtype.itemsize + channels]
-  values = np.where(ok[:, None], values, 0).astype(dt)
+  if i.wrmask == 15 and img.pitch % (4 * img.dtype.itemsize) == 0:
+    if img not in t.texture_rows: t.texture_rows[img] = mem.view(img.dtype).reshape(-1, 4)
+    values = t.texture_rows[img].take(off // (4 * img.dtype.itemsize), axis=0, mode="clip")
+  else: values = mem.view(img.dtype)[off[:, None] // img.dtype.itemsize + channels]
+  values[~ok] = 0 # advanced indexing above gives a private copy; leave the texture memory untouched
+  values = values.astype(dt, copy=False)
   for n in range(len(channels)): t.write(i.dst + n, dt == np.float16, values[:, n])
 
 def exec_ibo(t:Threads, i:Ibo, k:int): # out of bounds stores are dropped
@@ -426,11 +456,13 @@ EXEC:dict[type, Callable] = {Cat1: exec_mov, Cat2: exec_alu, Cat3: exec_alu, Cat
                              Stg: exec_mem, Load: exec_mem, Store: exec_mem}
 
 def run(d:Dispatch):
+  from test.mockgpu.qcom.emu_native import plan, kernels
   n_local, n_groups = math.prod(d.local_size), math.prod(d.groups)
   tid = np.arange(n_local * n_groups)
   if not len(tid): return
   lid, gid = tid % n_local, tid // n_local
   prog = decode(d.image)
+  native, compiled = plan(d.image, d.entry), None
   t = Threads(d, len(tid))
   ops = {i.op for i in prog if isinstance(i, (Load, Store))}
   if ops & {mesa.OPC_LDL, mesa.OPC_STL}:
@@ -451,6 +483,12 @@ def run(d:Dispatch):
         cur = int(pc[live].min()) # lowest pc first, so paths reconverge and nobody passes a bar early
         t.mask = (pc == cur) & ~done
       if isinstance(i := prog[cur], NotImplementedError): raise i
+      if (block := native.get(cur)) is not None:
+        if compiled is None: compiled = kernels(d.image, d.entry)
+        block.execute(t, compiled[cur])
+        if together is not None: together = block.end
+        else: pc[t.mask] = block.end
+        continue
       if (fn := EXEC.get(type(i))) is not None:
         for k in range(i.iterations): fn(t, i, k)
         if together is not None: together = cur + 1
