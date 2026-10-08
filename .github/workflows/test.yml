@@ -318,7 +318,8 @@ jobs:
             python examples/openpilot/compile_onnx.py "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" /tmp/openpilot.pkl --benchmark-runs 1
             python examples/openpilot/load_pickle.py --run /tmp/openpilot.pkl --runs 3
           done
-          MODEL_PKL=/tmp/openpilot.pkl python -m pytest -n=auto test/external/external_test_compile.py
+          MODEL_ONNX="https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/dmonitoring_model.onnx" \
+            MODEL_PKL=/tmp/openpilot.pkl python -m pytest -n=auto test/external/external_test_compile.py
       - name: Test warps (DEV=CPU:LLVM)
         env:
           DEV: CPU:LLVM
