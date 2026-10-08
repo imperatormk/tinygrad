@@ -617,6 +617,7 @@ class QCOMCLRenderer(OpenCLRenderer):
     self.compiler = QCOMCompiler(target.arch)
 
   def render_cast(self, u:UOp, val:str) -> str:
+    if u.dtype == dtypes.float and u.src[0].dtype in (dtypes.int64, dtypes.uint64): return f"convert_{self.render_type(u)}_rte({val})"
     if u.dtype == dtypes.half and u.src[0].dtype == dtypes.float: return f"convert_{self.render_type(u)}_rte({val})"
     return super().render_cast(u, val)
 

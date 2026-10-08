@@ -11,12 +11,16 @@ TYPES = [np.dtype(t) for t in ("f2", "f4", "u2", "u4", "i2", "i4", "u1", "i1")] 
 HALF_TYPES = (0, 2, 4, 6, 7)
 FLUT = [0.0, 0.5, 1.0, 2.0, math.e, math.pi, 1/math.pi, 1/math.log2(math.e), math.log2(math.e), 1/math.log2(10), math.log2(10), 4.0]
 
+@functools.cache
 def view(kind:str, half:bool) -> np.dtype: return np.dtype(f"{kind}{2 if half else 4}")
 def sext(x:int, n:int) -> int: return x - (1 << n) if x & (1 << (n - 1)) else x
 
 class Field:
   def __init__(self, lo:int, hi:int|None=None): self.lo, self.hi = lo, lo if hi is None else hi
-  def __get__(self, i, owner=None) -> int: return getbits(i.word, self.lo, self.hi)
+  def __set_name__(self, owner, name): self.name = name
+  def __get__(self, i, owner=None) -> int:
+    i.__dict__[self.name] = value = getbits(i.word, self.lo, self.hi)
+    return value
 
 @dataclass(frozen=True)
 class Src:
@@ -312,10 +316,12 @@ def exec_mov(t:Threads, i:Cat1, k:int):
   t.write(i.dst + k, i.dst_type in HALF_TYPES, v.astype(dst_dt))
 
 def ftz(v): # float alu flushes denormal sources and results, cov doesn't
-  return np.where(np.abs(v) < np.finfo(v.dtype).tiny, np.copysign(v.dtype.type(0), v), v) if v.dtype.kind == "f" else v
+  if v.dtype.kind != "f" or not (mask := np.abs(v) < np.finfo(v.dtype).tiny).any(): return v
+  return np.where(mask, np.copysign(v.dtype.type(0), v), v)
 
 def canonical_nan(v):
-  return np.where(np.isnan(v), v.dtype.type(np.nan), v) if v.dtype.kind == "f" else v
+  if v.dtype.kind != "f" or not (mask := np.isnan(v)).any(): return v
+  return np.where(mask, v.dtype.type(np.nan), v)
 
 def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
   srcs = [s.at(k) for s in i.srcs]
@@ -336,8 +342,13 @@ def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
       out = ((t.read(srcs[0], np.dtype(np.uint32)).astype(np.uint64) + t.read(srcs[1], np.dtype(np.uint32))) >> np.uint64(1)).astype(np.uint32)
   out = ftz(out) if i.op == mesa.OPC_SEL_F32 else canonical_nan(ftz(out))
   sat = i.sat and not (isinstance(i, Cat2) and i.op in CMPS)
-  if sat and out.dtype.kind != "f": raise i.error()
-  t.write(i.dst + k, i.dst_half, np.clip(out, 0, 1) if sat else out)
+  if sat:
+    if i.op == mesa.OPC_SUB_U:
+      a, b = [t.read(s, view("u", s.half)) for s in srcs]
+      out = np.where(a < b, out.dtype.type(0), out)
+    elif out.dtype.kind == "f": out = np.clip(out, 0, 1)
+    else: raise i.error()
+  t.write(i.dst + k, i.dst_half, out)
 
 def global_lanes(t:Threads, i:Ldg|Stg, nbytes:int) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
   addrs = (t.r[i.addr].astype(np.uint64) | (t.r[i.addr + 1].astype(np.uint64) << np.uint64(32))) + np.uint64(i.offset & (2**64 - 1))
@@ -391,18 +402,21 @@ def exec_isam(t:Threads, i:Cat5, k:int): # out of bounds reads the zero border c
   if not i.s2en and (i.samp >= len(t.d.samplers) or not t.d.samplers[i.samp]): raise RuntimeError(f"pc {i.pc}: unsupported sampler {i.samp}")
   img, dt = t.d.textures[tex], TYPES[i.type]
   mem, ok, off = texels(img, t.r[i.src1], t.r[i.src1 + 1])
-  for n, c in enumerate(c for c in range(4) if i.wrmask >> c & 1):
-    v = mem[off[:, None] + c * img.dtype.itemsize + np.arange(img.dtype.itemsize)].copy().view(img.dtype).reshape(-1)
-    t.write(i.dst + n, dt == np.float16, np.where(ok, v, 0).astype(dt))
+  channels = [c for c in range(4) if i.wrmask >> c & 1]
+  if not channels: return
+  values = mem.view(img.dtype)[off[:, None] // img.dtype.itemsize + channels]
+  values = np.where(ok[:, None], values, 0).astype(dt)
+  for n in range(len(channels)): t.write(i.dst + n, dt == np.float16, values[:, n])
 
 def exec_ibo(t:Threads, i:Ibo, k:int): # out of bounds stores are dropped
   if i.ssbo >= len(t.d.ibos): raise RuntimeError(f"pc {i.pc}: IBO {i.ssbo} is not bound")
   img, dt = t.d.ibos[i.ssbo], TYPES[i.type]
   mem, ok, off = texels(img, t.r[i.coord], t.r[i.coord + 1])
   lanes, esz = t.mask & ok, img.dtype.itemsize
+  indices = off[lanes] // esz
   for c in range(i.ncomp):
     v = (t.h if dt == np.float16 else t.r)[i.val + c].view(dt).astype(img.dtype)
-    mem[off[lanes][:, None] + c * esz + np.arange(esz)] = v[lanes].view(np.uint8).reshape(-1, esz)
+    mem.view(img.dtype)[indices + c] = v[lanes]
 
 EXEC:dict[type, Callable] = {Cat1: exec_mov, Cat2: exec_alu, Cat3: exec_alu, Cat4: exec_alu, Cat5: exec_isam, Ibo: exec_ibo, Ldg: exec_mem,
                              Stg: exec_mem, Load: exec_mem, Store: exec_mem}
@@ -410,6 +424,7 @@ EXEC:dict[type, Callable] = {Cat1: exec_mov, Cat2: exec_alu, Cat3: exec_alu, Cat
 def run(d:Dispatch):
   n_local, n_groups = math.prod(d.local_size), math.prod(d.groups)
   tid = np.arange(n_local * n_groups)
+  if not len(tid): return
   lid, gid = tid % n_local, tid // n_local
   prog = decode(d.image)
   t = Threads(d, len(tid))
@@ -424,9 +439,10 @@ def run(d:Dispatch):
   calls, depth = np.zeros((16, len(tid)), np.int64), np.zeros(len(tid), np.int64)
   together:int|None = d.entry # pc while nothing has diverged
   with np.errstate(all="ignore"):
-    while not done.all():
+    while True:
       if together is not None: cur, t.mask = together, t.everyone
       else:
+        if done.all(): break
         if not (live := ~done & ~blocked).any(): raise RuntimeError("every thread is waiting at a bar")
         cur = int(pc[live].min()) # lowest pc first, so paths reconverge and nobody passes a bar early
         t.mask = (pc == cur) & ~done
