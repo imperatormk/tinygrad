@@ -219,6 +219,7 @@ def _compile_kernel(x:tuple[int, tuple[UOp, Renderer], dict]) -> tuple[int, UOp]
 
 def _get_call_to_compile(c:UOp) -> tuple[UOp, Renderer]|None:
   ast = c.body
+  if ast.op is Ops.CUSTOM_FUNCTION and ast.arg.name == "validate": return ast.src[0], Device["CPU"].renderer
   # a PROGRAM with a ProgramInfo and a BINARY is already compiled
   if (ast.op is Ops.SINK and isinstance(ast.arg, KernelInfo)) or \
      (ast.op is Ops.PROGRAM and not (isinstance(ast.arg, ProgramInfo) and ast.src[-1].op is Ops.BINARY)):
@@ -235,7 +236,7 @@ def lower_and_compile(linear:UOp, verbose=True) -> UOp:
   if len(todo):
     # kernels that beam search must compile in the parent, beam needs device access to time candidates
 
-    pool = None if len(todo) == 1 or any(getattr(c.body.arg, "beam", 0) for c in ar) else get_worker_pool()
+    pool = None if len(todo) == 1 or any(getattr(a[0].arg, "beam", 0) for a in ar.values()) else get_worker_pool()
     ctx = {v.key: v.value for v in to_program_context}
     tasks = ((i, ast_ren, ctx) for i, (_, ast_ren) in enumerate(todo))
     try:
@@ -248,8 +249,9 @@ def lower_and_compile(linear:UOp, verbose=True) -> UOp:
       if pool is not None: terminate_worker_pool()
       raise
 
-  # swap the compiled PROGRAMs into the calls
-  return linear.substitute({c: c.replace(src=(to_program_cache[keys[c]], *c.src[1:])) for c in ar},
+  # Keep validation calls intact: exec_validate uses the precompiled CPU program from the cache.
+  # Swap target PROGRAMs into the calls.
+  return linear.substitute({c: c.replace(src=(to_program_cache[keys[c]], *c.src[1:])) for c in ar if c.body.op is not Ops.CUSTOM_FUNCTION},
                            name="precompile kernels")
 
 from tinygrad.runtime.support.hcq2 import hcq_compile, hcq_link, HCQInfo # noqa: E402 # down here, hcq2 imports realize
