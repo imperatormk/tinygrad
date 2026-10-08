@@ -1,11 +1,17 @@
-import ctypes, struct, platform, pathlib, shutil
+import ctypes, struct, platform, pathlib, shutil, functools
 from tinygrad.device import Compiler
-from tinygrad.helpers import DEBUG, system, fetch
-from tinygrad.runtime.support.compiler_mesa import disas_adreno
+from tinygrad.helpers import DEBUG, CCACHE, Context, system, fetch
 # see https://github.com/sirhcm/tinydreno
 from tinygrad.runtime.autogen import llvm_qcom
 
 def _read_lib(lib, off) -> int: return struct.unpack("I", lib[off:off+4])[0]
+
+# Renderers are reconstructed for each compilation task. Keep the compiler (and its QEMU server) local to the worker process.
+def qcom_compiler(arch:str) -> "QCOMCompiler": return _qcom_compiler(arch, bool(CCACHE))
+
+@functools.cache
+def _qcom_compiler(arch:str, ccache:bool) -> "QCOMCompiler":
+  with Context(CCACHE=ccache): return QCOMCompiler(arch)
 
 class QCOMCompiler(Compiler):
   def __init__(self, arch:str):
@@ -43,5 +49,6 @@ class QCOMCompiler(Compiler):
     llvm_qcom.cl_compiler_free_assembly(ptr)
     return ret
 
-  def disassemble(self, lib: bytes): disas_adreno(lib[(ofs:=_read_lib(lib, 0xc0)):ofs+_read_lib(lib, 0x100)], self.chip_id)
-
+  def disassemble(self, lib: bytes):
+    from tinygrad.runtime.support.compiler_mesa import disas_adreno
+    disas_adreno(lib[(ofs:=_read_lib(lib, 0xc0)):ofs+_read_lib(lib, 0x100)], self.chip_id)

@@ -1,0 +1,57 @@
+name: QCOM same-runner verification
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [qcom-a630-model-perf]
+    paths: [.github/workflows/qcom-verify.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: before-after-before (${{ matrix.renderer }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        renderer: [IR3, CL]
+    env:
+      CACHE_VERSION: '20'
+      PYTHONPATH: ${{ github.workspace }}
+      PYTHONUNBUFFERED: 1
+      PYTHONFAULTHANDLER: 1
+      CHECK_OOB: 1
+      DEV: MOCK+QCOM:${{ matrix.renderer }}
+      PARALLEL: 4
+      CCACHE: 0
+      BEAM_MAX_TASKS_PER_CHILD: 256
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 4
+      - uses: ./.github/actions/setup-tinygrad
+        with:
+          key: qcom-verify-${{ matrix.renderer }}
+          deps: testing_unit mesa
+          qemu: ${{ matrix.renderer == 'CL' }}
+      - name: Prepare fixed revisions
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/qcom-before" c252afa7c035852fd25280611e57169b43b4ec57
+          git worktree add --detach "$RUNNER_TEMP/qcom-after" d2e936bebbda4cd40cba0a47feff86614f4d00f8
+      - name: Compare models on the same runner
+        run: |
+          python extra/verify_qcom_models.py \
+            --before "$RUNNER_TEMP/qcom-before" --after "$RUNNER_TEMP/qcom-after" \
+            --output "$RUNNER_TEMP/qcom-verification"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: qcom-verification-${{ matrix.renderer }}
+          path: |
+            ${{ runner.temp }}/qcom-verification/**/*.json
+            ${{ runner.temp }}/qcom-verification/**/*.jsonl
+            ${{ runner.temp }}/qcom-verification/**/*.log
+            ${{ runner.temp }}/qcom-verification/**/*.txt

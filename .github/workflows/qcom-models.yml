@@ -1,0 +1,60 @@
+name: QCOM model performance
+
+on:
+  workflow_dispatch:
+  # Temporary experiment: also bootstraps the workflow on the feature branch.
+  push:
+    branches: [qcom-a630-model-perf]
+    paths: [.github/workflows/qcom-models.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  models:
+    name: openpilot (${{ matrix.renderer }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30 # Temporary native-emulator experiment.
+    strategy:
+      fail-fast: false
+      matrix:
+        renderer: [IR3, CL]
+    env:
+      CACHE_VERSION: '20'
+      PYTHONPATH: ${{ github.workspace }}
+      PYTHONFAULTHANDLER: 1
+      PYTHONUNBUFFERED: 1
+      CHECK_OOB: 1
+      CCACHE: 0
+      DEV: MOCK+QCOM:${{ matrix.renderer }}
+      # Keep the compiler servers alive for this bounded model compilation.
+      BEAM_MAX_TASKS_PER_CHILD: 256
+      LFS_SHA: '51b12d20a25b76fa8a5717c2e5af01f148e469e2'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-tinygrad
+        with:
+          key: qcom-model-perf-${{ matrix.renderer }}
+          deps: testing_unit mesa
+          qemu: ${{ matrix.renderer == 'CL' }}
+      - name: Test native emulator semantics
+        run: python -m pytest test/device/qcom/test_emu_native.py test/device/qcom/test_emu_helpers.py -q -n12
+      - name: Test openpilot models
+        run: |
+          for model in dmonitoring_model driving_supercombo; do
+            echo "::group::$model"
+            /usr/bin/time -f 'model total: %e s; peak RSS: %M KiB' env IMAGE=1 FLOAT16=1 \
+              python examples/openpilot/compile_onnx.py \
+              "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" \
+              "/tmp/$model.pkl" --benchmark-runs 1 --timings "/tmp/$model-timings.json" 2>&1 | tee "/tmp/$model.log"
+            echo '::endgroup::'
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: qcom-models-${{ matrix.renderer }}
+          path: |
+            /tmp/dmonitoring_model.log
+            /tmp/driving_supercombo.log
+            /tmp/dmonitoring_model-timings.json
+            /tmp/driving_supercombo-timings.json
