@@ -32,6 +32,21 @@ class TestQCOMEmu(unittest.TestCase):
         a = np.concatenate((np.array(values, dt), rng.integers(limit.min, limit.max, 1024, dtype=dt)))
         np.testing.assert_equal(Tensor(a).cast(dtypes.float32).numpy(), a.astype(np.float32))
 
+  def test_add64(self):
+    # A scalar int64 + 1 used to trigger an IndexedMap assertion in the CL compiler.
+    bits = np.array([0, 1, 0xffffffff, 0x100000000, 0xffffffffffffffff, 0x7fffffffffffffff, 0x8000000000000000, 0x12345678ffffffff], np.uint64)
+    for dt in (np.int64, np.uint64):
+      a, b = bits.view(dt), bits[::-1].copy().view(dt)
+      for n in (1, len(a)):
+        for off in range(0, len(a), n):
+          av, bv = a[off:off+n], b[off:off+n]
+          np.testing.assert_equal((Tensor(av) + 1).numpy(), av + 1)
+          np.testing.assert_equal((Tensor(av) + Tensor(bv)).numpy(), av + bv)
+      rng = np.random.default_rng(1)
+      av, bv, cv = [rng.integers(0, 2**64, 256, dtype=np.uint64).view(dt) for _ in range(3)]
+      with Context(NOOPT=1): # exercise scalar lowering across many lanes, including nested expressions
+        np.testing.assert_equal((Tensor(av) + Tensor(bv) + Tensor(cv)).numpy(), av + bv + cv)
+
   def test_half_const(self):
     np.testing.assert_equal((Tensor([1.5, 2.5, 1.0], dtype=dtypes.half) - 1.0).numpy(), np.array([0.5, 1.5, 0.0], np.float16))
 
