@@ -616,6 +616,10 @@ class QCOMCLRenderer(OpenCLRenderer):
     from tinygrad.runtime.support.compiler_qcom import QCOMCompiler
     self.compiler = QCOMCompiler(target.arch)
 
+  def render_cast(self, u:UOp, val:str) -> str:
+    if u.dtype == dtypes.half and u.src[0].dtype == dtypes.float: return f"convert_{self.render_type(u)}_rte({val})"
+    return super().render_cast(u, val)
+
   # QCOM compiler is flaky with half
   def supported_dtypes(self):
     return {d for d in Renderer.supported_dtypes(self)
