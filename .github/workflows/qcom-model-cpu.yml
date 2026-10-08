@@ -62,3 +62,36 @@ jobs:
         with:
           name: qcom-model-cpu-${{ matrix.renderer }}
           path: /tmp/*-cpu.log
+
+  cpu-production-reference:
+    name: Production CPU models with ONNX reference
+    env:
+      CACHE_VERSION: '20'
+      CAPTURE_PROCESS_REPLAY: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.title, '[pr]') && '1' || '0' }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PYTHONPATH: ${{ github.workspace }}
+      CHECK_OOB: 1
+      PYTHONFAULTHANDLER: 1
+      LFS_SHA: "51b12d20a25b76fa8a5717c2e5af01f148e469e2"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+      - name: Setup Environment
+        uses: ./.github/actions/setup-tinygrad
+        with:
+          key: openpilot-compile
+          deps: testing
+          llvm: 'true'
+          opencl: 'true'
+      - name: Test models (DEV=CPU:LLVM)
+        env:
+          DEV: CPU:LLVM
+        run: |
+          for model in driving_supercombo dmonitoring_model; do
+            python examples/openpilot/compile_onnx.py "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" /tmp/openpilot.pkl --benchmark-runs 1
+            python examples/openpilot/load_pickle.py --run /tmp/openpilot.pkl --runs 3
+          done
+          MODEL_ONNX="https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/dmonitoring_model.onnx" \
+            MODEL_PKL=/tmp/openpilot.pkl python -m pytest -n=auto test/external/external_test_compile.py
