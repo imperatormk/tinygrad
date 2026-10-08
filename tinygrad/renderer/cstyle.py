@@ -617,8 +617,8 @@ class QCOMCLRenderer(OpenCLRenderer):
 
   def __init__(self, target:Target):
     super().__init__(target)
-    from tinygrad.runtime.support.compiler_qcom import QCOMCompiler
-    self.compiler = QCOMCompiler(target.arch)
+    from tinygrad.runtime.support.compiler_qcom import qcom_compiler
+    self.compiler = qcom_compiler(target.arch)
 
   def render_add64(self, u:UOp) -> str:
     return f"as_{self.render_type(u)}(tg_add64(as_ulong({self[u.src[0]]}), as_ulong({self[u.src[1]]})))"
