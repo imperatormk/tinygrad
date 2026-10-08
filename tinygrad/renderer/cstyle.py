@@ -610,10 +610,30 @@ class HIPCCRenderer(HIPRenderer):
   def __init__(self, target:Target): super().__init__(target, use_hipcc=True)
 
 class QCOMCLRenderer(OpenCLRenderer):
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.ADD, (dtypes.int64, dtypes.uint64), name="x"), lambda ctx,x: ctx.render_add64(x) if x.max_numel() == 1 else None),
+  ]) + OpenCLRenderer.string_rewrite
+
   def __init__(self, target:Target):
     super().__init__(target)
-    from tinygrad.runtime.support.compiler_qcom import QCOMCompiler
-    self.compiler = QCOMCompiler(target.arch)
+    from tinygrad.runtime.support.compiler_qcom import qcom_compiler
+    self.compiler = qcom_compiler(target.arch)
+
+  def render_add64(self, u:UOp) -> str:
+    return f"as_{self.render_type(u)}(tg_add64(as_ulong({self[u.src[0]]}), as_ulong({self[u.src[1]]})))"
+
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
+    # QCOM's scalar 64-bit add lowering can crash. A helper keeps nested adds from duplicating operand expressions.
+    if any(u.op is Ops.ADD and u.dtype in (dtypes.int64, dtypes.uint64) and u.max_numel() == 1 for u in uops):
+      prefix = (prefix or []) + ["static inline ulong tg_add64(ulong a, ulong b) {",
+        "  uint2 x = as_uint2(a), y = as_uint2(b);", "  uint lo = x.x + y.x;",
+        "  return as_ulong((uint2)(lo, x.y + y.y + (lo < x.x)));", "}"]
+    return super().render_kernel(function_name, kernel, bufs, uops, prefix)
+
+  def render_cast(self, u:UOp, val:str) -> str:
+    if u.dtype == dtypes.float and u.src[0].dtype in (dtypes.int64, dtypes.uint64): return f"convert_{self.render_type(u)}_rte({val})"
+    if u.dtype == dtypes.half and u.src[0].dtype == dtypes.float: return f"convert_{self.render_type(u)}_rte({val})"
+    return super().render_cast(u, val)
 
   # QCOM compiler is flaky with half
   def supported_dtypes(self):
