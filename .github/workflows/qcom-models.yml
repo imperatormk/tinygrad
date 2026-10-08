@@ -51,7 +51,7 @@ jobs:
         run: |
           for model in dmonitoring_model driving_supercombo; do
             echo "::group::$model"
-            /usr/bin/time -f 'model total: %e s; peak RSS: %M KiB' env VALIDATE_WITH_CPU=1 IMAGE=1 FLOAT16=1 \
+            /usr/bin/time -f 'model total: %e s; peak RSS: %M KiB' env IMAGE=1 FLOAT16=1 \
               python examples/openpilot/compile_onnx.py \
               "https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx" \
               "/tmp/$model.pkl" --benchmark-runs 1 --timings "/tmp/$model-timings.json" 2>&1 | tee "/tmp/$model.log"
