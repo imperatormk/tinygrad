@@ -107,12 +107,16 @@ class TestQCOMEmu(unittest.TestCase):
       dispatches.append(d)
       run(d)
     w = np.random.default_rng(0).standard_normal((1, 1, 13, 13)).astype(np.float32)
-    with patch.object(emu, "run", capture), Context(IMAGE=1): (Tensor(w).conv2d(Tensor(w[..., :3, :3]), padding=1) + Tensor(w)).realize()
+    x, y = Tensor(np.arange(-40, 40, dtype=np.int32)), Tensor(np.arange(80, dtype=np.int32) * 7919)
+    u = Tensor(np.arange(80, dtype=np.uint32) * 2654435761)
+    with patch.object(emu, "run", capture), Context(IMAGE=1):
+      Tensor.realize((Tensor(w).conv2d(Tensor(w[..., :3, :3]), padding=1) + Tensor(w)), ((x * y - x) ^ (y >> 3) | (x & ~y)), (x > 0).where(x, y),
+                     ((u >> 5) & (u | 3)) - (u << 2))
     special = np.array([1e-45, -1e-38, -0.0, np.nan, np.inf, -np.inf, 1.5, 3e38, -2.0, 1e-20, 7.0, 0.1, -3.0], np.float32).view(np.uint32)
     checked = 0
     for d in dispatches:
       prog = emu.decode(d.image)
-      targets = {i.target for i in prog if isinstance(i, emu.Cat0)}
+      targets = {i.target for i in prog if isinstance(i, emu.Cat0) and i.op in emu.JUMPS}
       for start, b in emu.alu_blocks(d.image, d.entry).items():
         self.assertFalse(targets & set(range(start + 1, b.end)))
         fast, slow = emu.Threads(d, 13), emu.Threads(d, 13)
@@ -121,7 +125,7 @@ class TestQCOMEmu(unittest.TestCase):
         emu.exec_block(fast, b)
         with np.errstate(all="ignore"):
           for i in prog[start:b.end]:
-            for k in range(i.iterations): emu.exec_alu(slow, i, k)
+            for k in range(i.iterations if type(i) in emu.EXEC else 0): emu.EXEC[type(i)](slow, i, k)
         np.testing.assert_equal(fast.r, slow.r)
         checked += 1
     self.assertGreater(checked, 0)
