@@ -101,9 +101,17 @@ def store_image(x:UOp, d:UOp) -> UOp:
   lanes = d.src if d.op is Ops.STACK else tuple(d.index(i) for i in range(d.shape[0]))
   return x.store(UOp.stack(*[as_float(s) for s in lanes]))
 
+def promote_image_alu(x:UOp) -> UOp|None:
+  # image reads are float even for half buffers
+  if not ({s.dtype for s in x.src} >= {dtypes.float, dtypes.half}): return None
+  return x.replace(src=tuple(s.cast(dtypes.float) if s.dtype is dtypes.half else s for s in x.src))
+
 pm_simplify_add_image = PatternMatcher([
   (UPat(Ops.SHRINK, src=(UPat(Ops.PARAM, name="buf"), UPat(name="x"), UPat(arg=4))), transform_to_image),
   (UPat(Ops.INDEX, dtype=dtypes.float, name="x").store(UPat(name="d", dtype=dtypes.half)), store_image),
+  (UPat(GroupOp.ALU, name="x"), promote_image_alu),
+  (UPat(Ops.STORE, src=(UPat(dtype=dtypes.half, name="idx"), UPat(name="v", dtype=dtypes.float)), allow_any_len=True, name="st"),
+   lambda st,idx,v: st.replace(src=(idx, v.cast(dtypes.half))+st.src[2:])),
 ])
 
 def memory_coalescing(sink:UOp, ctx:Renderer) -> UOp:
