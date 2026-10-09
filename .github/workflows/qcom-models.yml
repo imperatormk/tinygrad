@@ -31,7 +31,9 @@ jobs:
           pydeps: "onnxruntime==1.24.1"
           qemu: ${{ matrix.renderer == 'CL' }}
       - name: Runner CPU
-        run: lscpu | grep -E "Model name|^CPU\(s\)|Flags" | cut -c1-200
+        run: |
+          lscpu | grep -E "Model name|^CPU\(s\)"
+          echo "vector flags: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E '^(avx|fma|sse4)' | sort | tr '\n' ' ')"
       - name: Test openpilot models
         env:
           BEAM_MAX_TASKS_PER_CHILD: 1024
