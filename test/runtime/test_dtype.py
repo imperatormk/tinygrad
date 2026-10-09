@@ -242,6 +242,7 @@ class TestHalfDType(TestDType):
   def test_cast_round_to_even(self):
     data = np.array([1.00048828125, 1.00146484375, 1.0006, -1.00048828125, -1.00146484375, -1.0006], dtype=np.float32)
     np.testing.assert_array_equal(Tensor(data).half().numpy(), data.astype(np.float16))
+  @unittest.skipIf(Device.DEFAULT in ("CL", "WEBGPU"), "mesa (rusticl, lavapipe) folds float(half(x)) to x, mesa#15948")
   def test_fused_normal_cast_roundtrip(self):
     data = np.array([1.0001, 1.0006, -1.0006, 0.3333, 2049.0, 0.0, -0.0], dtype=np.float32)
     actual = Tensor(data).realize().half().float().numpy()
