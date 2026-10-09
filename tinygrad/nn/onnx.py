@@ -4,7 +4,7 @@ import dataclasses, functools, io, math, types, warnings, pathlib, sys, os, stru
 from tinygrad.nn.state import TensorIO
 from tinygrad.tensor import Tensor, is_numpy_ndarray
 from tinygrad.mixin.op import ReductionStr
-from tinygrad.helpers import getenv, all_same, prod, flatten, make_tuple, argsort, get_single_element, polyN, Context
+from tinygrad.helpers import getenv, all_same, prod, flatten, make_tuple, argsort, get_single_element, polyN, Context, IMAGE
 from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype, truncate, least_upper_dtype, DTYPES_DICT
 from tinygrad.device import Device
 from tinygrad.uop.ops import sint, _broadcast_shape
@@ -607,7 +607,17 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def softmax_13(x:Tensor, axis:int=-1): return x.softmax(axis)
   Softmax = {OpSetId(Domain.ONNX, 1):softmax_1, OpSetId(Domain.ONNX, 13):softmax_13}
   def HardSigmoid(x:Tensor, alpha:float=0.2, beta:float=0.5): return (alpha*x + beta).clip(0, 1)
-  def Gelu(x:Tensor, approximate:str|None=None): return x.gelu(approximate="none" if approximate is None else approximate)
+  def Gelu(x:Tensor, approximate:str|None=None):
+    if x.dtype == dtypes.half and approximate == "tanh":
+      # Keep intermediate precision and avoid cancellation in sigmoid-based tanh near zero.
+      xf = x.float()
+      t = math.sqrt(truncate[dtypes.float](2/math.pi)) * (xf + 0.044715 * xf**3)
+      small = t.clip(-0.5, 0.5)
+      z = small * small
+      # Pade [7/6] tanh on [-0.5, 0.5]; bound its argument to keep both branches finite.
+      rational = small * (135135 + z*(17325 + z*(378 + z))) / (135135 + z*(62370 + z*(3150 + 28*z)))
+      return (0.5*xf*(1 + (t.abs() <= 0.5).where(rational, t.tanh()))).half()
+    return x.gelu(approximate="none" if approximate is None else approximate)
   def BiasGelu(x: Tensor, bias: Tensor, approximate: str | None = None) -> Tensor: return Gelu(x + bias, approximate)
   def FastGelu(x:Tensor, bias:Tensor|None=None): return (x + bias).gelu() if bias is not None else x.gelu() # this is tanh approximated
   def PRelu(X:Tensor, slope:Tensor): return (X > 0).where(X, X * slope)
@@ -737,8 +747,10 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
 
   def Conv(X: Tensor, W: Tensor, B:Tensor|None=None, auto_pad:AUTO_PAD_OPTIONS="NOTSET", dilations:tuple[int, ...]|int=1, group:int=1,
           kernel_shape:tuple[int, ...]|None=None, pads:tuple[int, ...]|int=0, strides:tuple[int, ...]|int=1):
-    return X.conv2d(W, B, stride=strides, groups=group, dilation=dilations,
-                    padding=_resolve_pool_pads(X, pads, kernel_shape or W.shape[2:], dilations, strides, auto_pad))
+    acc_dtype = dtypes.float if X.dtype == dtypes.half and B is not None and not IMAGE else None
+    ret = X.conv2d(W, B, stride=strides, groups=group, dilation=dilations, dtype=acc_dtype,
+                   padding=_resolve_pool_pads(X, pads, kernel_shape or W.shape[2:], dilations, strides, auto_pad))
+    return ret.cast(X.dtype) if acc_dtype is not None else ret
 
   def ConvTranspose(X: Tensor, W: Tensor, B:Tensor|None=None, auto_pad:AUTO_PAD_OPTIONS="NOTSET", dilations:tuple[int, ...]|int=1, group:int=1,
                     kernel_shape:tuple[int, ...]|None=None, pads:Sequence[int]|None=None, output_shape:Sequence[int]|None=None,
@@ -767,9 +779,10 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def GlobalMaxPool(X:Tensor): return X.max(axis=tuple(range(2, X.ndim)), keepdim=True)
 
   def Gemm(A:Tensor, B:Tensor, C:Tensor|None=None, alpha:float=1.0, beta:float=1.0, transA:int=0, transB:int=0, broadcast=0):
-    ret = alpha * (A.transpose(transA) @ B.transpose(transB))
+    acc_dtype = dtypes.float if A.dtype == dtypes.half and C is not None and not IMAGE else None
+    ret = alpha * A.transpose(transA).matmul(B.transpose(transB), dtype=acc_dtype)
     if C is not None: ret = ret + beta * (C if broadcast == 0 else C.reshape([-1 if i < len(C.shape) else 1 for i in range(ret.ndim)][::-1]))
-    return ret
+    return ret.cast(A.dtype) if acc_dtype is not None else ret
 
   def Einsum(*Inputs:Tensor, equation:str): return Tensor.einsum(equation, *Inputs)
 

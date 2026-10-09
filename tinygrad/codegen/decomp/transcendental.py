@@ -208,7 +208,7 @@ def xexp2(d:UOp) -> UOp:
                   0.6931471805599452862e+0, 0.1000000000000000000e+1])
   else: u = polyN(s, [0.1535920892e-3, 0.1339262701e-2, 0.9618384764e-2, 0.5550347269e-1, 0.2402264476e+0, 0.6931471825e+0, 1.0])
   u = ldexp2k(u, q) # u*2^q
-  upper, lower = {dtypes.float64: (1024, -2000), dtypes.float32: (128, -150), dtypes.float16: (23, -22)}[d.dtype]
+  upper, lower = {dtypes.float64: (1024, -2000), dtypes.float32: (128, -150), dtypes.float16: (23, -25)}[d.dtype]
   # Replace x >= upper with +inf
   u = (d >= upper).where(d.const_like(math.inf), u)
   # Replace x < lower with zero.

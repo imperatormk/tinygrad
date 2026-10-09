@@ -78,14 +78,15 @@ class TestQCOMEmu(unittest.TestCase):
     expected = [0x3c01, 0x7c00, 0x0] if isinstance(Device.default.renderer, QCOMCLRenderer) else [0x3c00, 0x7bff, 0x0]
     self.assertEqual(out.view(np.uint16).tolist(), expected)
 
+  @Context(IMAGE=1, FLOAT16=1)
   def test_cov(self):
-    # CL uses RNE for int->float and explicitly requests RNE for float->half; IR3 emits truncating cov instructions.
-    rte = isinstance(Device.default.renderer, QCOMCLRenderer)
+    # Both compilers request round-to-nearest-even; native half conversion still flushes subnormals.
     np.testing.assert_equal(Tensor([2**24 + 3, -(2**24 + 3), 2**31 - 1], dtype=dtypes.int32).cast(dtypes.float32).numpy(),
-                            np.array([2**24 + 4, -(2**24 + 4), 2**31] if rte else [2**24 + 2, -(2**24 + 2), 2**31 - 2**7], np.float32))
+                            np.array([2**24 + 4, -(2**24 + 4), 2**31], np.float32))
     np.testing.assert_equal(Tensor([1 + 2**-11 + 2**-13, 1e5, -1e30, 2**-20], dtype=dtypes.float32).cast(dtypes.half).numpy(),
-                            np.array([1 + 2**-10, np.inf, -np.inf, 0] if rte else [1, 65504, -65504, 0], np.float16))
+                            np.array([1 + 2**-10, np.inf, -np.inf, 0], np.float16))
 
+  @Context(IMAGE=1, FLOAT16=1)
   def test_denormals(self):
     np.testing.assert_equal((Tensor(np.array([1e-45, -1e-39, 1.0], np.float32)) * 1.5).numpy(), np.array([0, -0.0, 1.5], np.float32))
     np.testing.assert_equal(Tensor(np.array([1e-40], np.float32)).log2().numpy(), np.array([-np.inf], np.float32))

@@ -66,6 +66,22 @@ class TestMainOnnxOps(TestOnnxOps):
     outputs = ["out"]
     self.helper_test_single_op("MeanVarianceNormalization", inputs, attributes, outputs)
 
+  def test_half_bias_rounding(self):
+    a, b, c = np.array([[1.5, 1.0]], np.float16), np.array([[1.0009765625], [1.0]], np.float16), np.array([-2.5], np.float16)
+    self.helper_test_single_op("Gemm", {"A": a, "B": b, "C": c}, {}, ["Y"])
+    self.helper_test_single_op("Conv", {"X": a.reshape(1, 2, 1, 1), "W": b.reshape(1, 2, 1, 1), "B": c}, {}, ["Y"])
+
+  def test_half_gelu_tanh(self):
+    x = np.array([0.2186279296875, 0.224609375, 0.236083984375, -0.353271484375, -1.5, 0.0], dtype=np.float16)
+    self.helper_test_single_op("Gelu", {"X": x}, {"approximate": "tanh"}, ["Y"], rtol=1e-4, atol=1e-4)
+
+  def test_half_bias_image_dtype(self):
+    from tinygrad.nn.onnx import onnx_ops
+    with Context(IMAGE=1, FLOAT16=1):
+      a, b, c = Tensor.ones(1, 2, dtype=dtypes.half), Tensor.ones(2, 1, dtype=dtypes.half), Tensor.zeros(1, dtype=dtypes.half)
+      self.assertEqual(onnx_ops["Gemm"](a, b, c).dtype, dtypes.float)
+      self.assertEqual(onnx_ops["Conv"](a.reshape(1, 2, 1, 1), b.reshape(1, 2, 1, 1), c).dtype, dtypes.float)
+
   def test_conv(self):
     # test VALID auto_pad
     inputs = {
