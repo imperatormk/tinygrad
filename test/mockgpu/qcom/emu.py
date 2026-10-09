@@ -399,8 +399,8 @@ def texels(img:Image, x:np.ndarray, y:np.ndarray) -> tuple[np.ndarray, np.ndarra
   ok = (x >= 0) & (x < img.width) & (y >= 0) & (y < img.height)
   return np.frombuffer(to_mv(img.addr, img.pitch * img.height), np.uint8), ok, np.where(ok, y * img.pitch + x * 4 * img.dtype.itemsize, 0)
 
-def exec_isam(t:Threads, i:Cat5, k:int): # out of bounds reads the zero border color
-  tex = i.tex
+def exec_isams(t:Threads, insts:tuple[Cat5, ...]): # out of bounds reads the zero border color. insts share texture, sampler, type and wrmask
+  i, tex = insts[0], insts[0].tex
   if i.s2en:
     if len(idx := np.unique(t.h[i.src3][t.mask])) != 1: raise i.error()
     tex = int(idx[0])
@@ -408,14 +408,18 @@ def exec_isam(t:Threads, i:Cat5, k:int): # out of bounds reads the zero border c
   if not i.s2en and (i.samp >= len(t.d.samplers) or not t.d.samplers[i.samp]): raise RuntimeError(f"pc {i.pc}: unsupported sampler {i.samp}")
   img, dt = t.d.textures[tex], TYPES[i.type]
   if not len(channels := wrmask_channels(i.wrmask)): return
-  if isinstance(t.h, np.ndarray) and img.dtype in TEX_DTYPES and dt in TEX_DTYPES and i.dst + len(channels) <= A0:
-    return isam_kernel(img.dtype, dt)(t.r.ctypes.data, t.mask.ctypes.data, img.addr, channels.ctypes.data, t.h.ctypes.data, n=t.r.shape[1],
-                                      src1=i.src1, dst=i.dst, nchan=len(channels), w=img.width, h=img.height, pitch=img.pitch // img.dtype.itemsize)
-  mem, ok, off = texels(img, t.r[i.src1], t.r[i.src1 + 1])
-  values = mem.view(img.dtype)[off[:, None] // img.dtype.itemsize + channels]
-  values[~ok] = 0
-  values = values.astype(dt, copy=False)
-  for n in range(len(channels)): t.write(i.dst + n, dt == np.float16, values[:, n])
+  if isinstance(t.h, np.ndarray) and img.dtype in TEX_DTYPES and dt in TEX_DTYPES and max(i.dst for i in insts) + len(channels) <= A0:
+    recs, tmp = np.array([(i.src1, i.dst) for i in insts], np.int32), np.empty(len(channels) * t.r.shape[1], dt)
+    return isam_kernel(img.dtype, dt, i.wrmask)(t.r.ctypes.data, t.mask.ctypes.data, img.addr, recs.ctypes.data, tmp.ctypes.data, t.h.ctypes.data,
+                                                n=t.r.shape[1], count=len(recs), w=img.width, h=img.height, pitch=img.pitch // img.dtype.itemsize)
+  for i in insts:
+    mem, ok, off = texels(img, t.r[i.src1], t.r[i.src1 + 1])
+    values = mem.view(img.dtype)[off[:, None] // img.dtype.itemsize + channels]
+    values[~ok] = 0
+    values = values.astype(dt, copy=False)
+    for n in range(len(channels)): t.write(i.dst + n, dt == np.float16, values[:, n])
+
+def exec_isam(t:Threads, i:Cat5, k:int): exec_isams(t, (i,))
 
 def exec_ibo(t:Threads, i:Ibo, k:int): # out of bounds stores are dropped
   if i.ssbo >= len(t.d.ibos): raise RuntimeError(f"pc {i.pc}: IBO {i.ssbo} is not bound")
@@ -465,9 +469,11 @@ class AluBlock:
   ops:tuple[int, ...]
 
 @functools.cache
+def block_starts(image:bytes, entry:int) -> set[int]: return {entry} | {i.target for i in decode(image) if isinstance(i, Cat0) and i.op in JUMPS}
+
+@functools.cache
 def alu_blocks(image:bytes, entry:int) -> dict[int, AluBlock]:
-  prog, blocks, pc = decode(image), {}, 0
-  starts = {entry} | {i.target for i in prog if isinstance(i, Cat0) and i.op in JUMPS}
+  prog, blocks, pc, starts = decode(image), {}, 0, block_starts(image, entry)
   while pc < len(prog):
     if block_records(prog[pc]) is None:
       pc += 1
@@ -525,18 +531,42 @@ TEX_DTYPES = {np.dtype(np.float16): dtypes.half, np.dtype(np.float32): dtypes.fl
 @functools.cache
 def wrmask_channels(wrmask:int) -> np.ndarray: return np.array([c for c in range(4) if wrmask >> c & 1], np.int32)
 
+@dataclass(frozen=True)
+class IsamRun:
+  end:int
+  insts:tuple[Cat5, ...]
+
 @functools.cache
-def isam_kernel(img_dt:np.dtype, dt:np.dtype) -> Callable[..., None]:
-  r, mask, n = lane_params()
-  img, chans = UOp.param(2, TEX_DTYPES[img_dt], 1 << 30, name="img"), UOp.param(3, dtypes.int32, 4, name="chans")
-  src1, dst, nchan, w, h, pitch = [UOp.variable(v, 0, 1 << 24) for v in ("src1", "dst", "nchan", "w", "h", "pitch")]
-  lane, j = UOp.range(n, 0), UOp.range(nchan, 1)
+def isam_runs(image:bytes, entry:int) -> dict[int, IsamRun]: # consecutive isams that one kernel call can do
+  prog, runs, pc, starts = decode(image), {}, 0, block_starts(image, entry)
+  def key(i) -> tuple|None: return (i.tex, i.samp, i.type, i.wrmask) if isinstance(i, Cat5) and not i.s2en else None
+  while pc < len(prog):
+    if not isinstance(i := prog[pc], Cat5) or (first := key(i)) is None:
+      pc += 1
+      continue
+    start, insts = pc, [i]
+    while (pc := pc + 1) < len(prog) and pc not in starts and (key(i := prog[pc]) == first or (isinstance(i, Cat0) and i.op == mesa.OPC_NOP)):
+      if isinstance(i, Cat5): insts.append(i)
+    if len(insts) > 1: runs[start] = IsamRun(pc, tuple(insts))
+  return runs
+
+@functools.cache
+def isam_kernel(img_dt:np.dtype, dt:np.dtype, wrmask:int) -> Callable[..., None]:
+  (r, mask, n), bits, ones = lane_params(), *((dtypes.uint32, 0xffffffff) if dt == np.float32 else (dtypes.uint16, 0xffff))
+  img, recs = UOp.param(2, TEX_DTYPES[img_dt], 1 << 30, name="img"), UOp.param(3, dtypes.int32, 2 << 16, name="recs")
+  tmp, out = UOp.param(4, bits, 4 * MAX_BLOCK_LANES, name="tmp"), r if dt == np.float32 else UOp.param(5, bits, NREGS * MAX_BLOCK_LANES, name="h")
+  count, w, h, pitch = [UOp.variable(v, 0, 1 << 24) for v in ("count", "w", "h", "pitch")]
+  k, lane, lane2, chans = UOp.range(count, 0), UOp.range(n, 1), UOp.range(n, 2), wrmask_channels(wrmask).tolist()
+  src1, dst = recs.index(k * 2).load(), recs.index(k * 2 + 1).load()
   x, y = r.index(src1 * n + lane).load(), r.index((src1 + 1) * n + lane).load()
-  ok = (x < w.cast(dtypes.uint32)) & (y < h.cast(dtypes.uint32))
-  texel = img.index(ok.where(y.cast(dtypes.int32) * pitch + x.cast(dtypes.int32) * 4 + chans.index(j).load(), 0)).load()
-  out, bits = (r, dtypes.uint32) if dt == np.float32 else (UOp.param(4, dtypes.uint16, NREGS * MAX_BLOCK_LANES, name="h"), dtypes.uint16)
-  value = ok.where(texel, 0).cast(TEX_DTYPES[dt]).bitcast(bits)
-  return cpu_kernel(out.index(((dst + j) * n + lane).valid(mask.index(lane).load().ne(0))).store(value).end(j).end(lane), "qcom_isam")
+  ok, base = (x < w.cast(dtypes.uint32)) & (y < h.cast(dtypes.uint32)), y.cast(dtypes.int32) * pitch + x.cast(dtypes.int32) * 4
+  texels = UOp.group(*[tmp.index(j * n + lane).store(ok.where(img.index(ok.where(base + c, 0)).load(), 0).cast(TEX_DTYPES[dt]).bitcast(bits))
+                       for j, c in enumerate(chans)]).end(lane)
+  keep, stores = mask.index(lane2).load().cast(bits) * ones, []
+  for j in range(len(chans)): # through scratch rows, like the alu blocks
+    reg = out.index((dst + j) * n + lane2)
+    stores.append(reg.store((tmp.after(texels).index(j * n + lane2).load() & keep) | (reg.load() & (keep ^ ones))))
+  return cpu_kernel(UOp.group(*stores).end(lane2).end(k), "qcom_isam")
 
 def taken(t:Threads, i:Cat0) -> np.ndarray: # lanes that go to i.target
   if i.op == mesa.OPC_JUMP: return t.everyone
@@ -556,7 +586,7 @@ def run(d:Dispatch):
   tid = np.arange(n_local * n_groups)
   lid, gid = tid % n_local, tid // n_local
   prog = decode(d.image)
-  blocks = alu_blocks(d.image, d.entry)
+  blocks:dict[int, AluBlock|IsamRun] = {**isam_runs(d.image, d.entry), **alu_blocks(d.image, d.entry)}
   t = Threads(d, len(tid))
   ops = {i.op for i in prog if isinstance(i, (Load, Store))}
   if ops & {mesa.OPC_LDL, mesa.OPC_STL}:
@@ -577,7 +607,8 @@ def run(d:Dispatch):
         t.mask = (pc == cur) & ~done
       if isinstance(i := prog[cur], NotImplementedError): raise i
       if (b := blocks.get(cur)) is not None:
-        exec_block(t, b)
+        if isinstance(b, AluBlock): exec_block(t, b)
+        else: exec_isams(t, b.insts)
         if together is not None: together = b.end
         else: pc[t.mask] = b.end
         continue
