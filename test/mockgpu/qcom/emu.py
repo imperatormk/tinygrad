@@ -50,6 +50,7 @@ def cat3src(x:int, half:bool, immed:int, r:int, neg:int) -> Src:
 
 class Inst:
   cat, opc, repeat = Field(61, 63), Field(55, 58), 0
+  srcs:list[Src]
   def __init__(self, pc:int, word:int):
     self.pc, self.word = pc, word
     self.op, self.iterations = self.cat << 7 | self.opc, self.repeat + 1
@@ -447,14 +448,14 @@ def block_source(spec:int|Src|tuple, srcs:list[Src], kind:str) -> tuple[int, int
   return (0, 0, (s.val & a & mask) ^ x) if s.kind == "i" else (s.val, a & mask, x)
 
 def block_records(i:Inst|NotImplementedError) -> list[list[int]]|None:
-  if isinstance(i, Cat1): ok = i.op == mesa.OPC_MOV and i.src_type == i.dst_type and i.src_type in (1, 3, 5)
-  else: ok = isinstance(i, (Cat2, Cat3)) and not (i.sat or i.dst_conv or i.dst_half or getattr(i, "ei", 0))
-  if not ok or i.op not in BLOCK_OPS or i.dst + i.iterations > A0: return None
+  if not isinstance(i, (Cat1, Cat2, Cat3)) or i.op not in BLOCK_OPS or i.dst + i.iterations > A0: return None
+  if isinstance(i, Cat1) and not (i.src_type == i.dst_type and i.src_type in (1, 3, 5)): return None
+  if isinstance(i, (Cat2, Cat3)) and (i.sat or i.dst_conv or i.dst_half or getattr(i, "ei", 0)): return None
   op, kind, spec = BLOCK_OPS[i.op]
   recs = []
   for k, srcs in enumerate(i.repeat_srcs):
-    if None in (sources := [block_source(x, srcs, kind) for x in spec]): return None
-    recs.append([op, i.dst + k, *[v for f in range(3) for v in (sources[0][f], sources[1][f], sources[2][f])]])
+    if len(sources := [s for x in spec if (s := block_source(x, srcs, kind)) is not None]) < 3: return None
+    recs.append([op, i.dst + k, *[s[f] for f in range(3) for s in sources]])
   return recs
 
 @dataclass(frozen=True)
