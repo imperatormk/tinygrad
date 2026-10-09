@@ -42,7 +42,7 @@ def nif(b:mesa.nir_builder, cond:mesa.nir_def, then_fn:Callable, else_fn:Callabl
 def nalu(b:mesa.nir_builder, op:str, *srcs:mesa.nir_def) -> mesa.nir_def:
   exact = b.exact
   # Preserve explicit floating add/multiply grouping through NIR optimization.
-  b.exact = exact or op in {"fadd", "fmul"}
+  b.exact = exact or op in {"fadd", "fmul", "ffma"}
   try: return g(f"nir_build_alu{len(srcs)}")(b, g(f"nir_op_{op}"), *srcs).contents
   finally: b.exact = exact
 
@@ -292,6 +292,7 @@ _nload_img = nir_instr(intrins=lambda dtype:{'IMAGE_DIM':mesa.GLSL_SAMPLER_DIM_2
       lambda b,img,idx_y,idx_x,dtype: mesa.nir_intrinsic_instr_create(b.shader, g("nir_intrinsic_image_load")))
 
 class IR3Renderer(NIRRenderer):
+  code_for_op = {**NIRRenderer.code_for_op, Ops.MULACC: lambda: None}
   def nload_img(ctx,img,idx_y,idx_x):
     ctx.texs.add(img)
     return _nload_img(ctx.b, ctx.r[img], ctx.r[idx_y], ctx.r[idx_x], img.dtype)
@@ -302,6 +303,9 @@ class IR3Renderer(NIRRenderer):
     (UPat(Ops.LOAD, src=(UPat.var('img').index(UPat.var('idx_y'), UPat.var('idx_x')), UPat.var("alt"), UPat.var("gate"))),
      lambda ctx,img,idx_y,idx_x,alt,gate: if_phi(ctx.b, ctx.r[gate], lambda: ctx.nload_img(img, idx_y, idx_x), lambda: ctx.r[alt])),
     (UPat(Ops.LOAD, src=(UPat.var('img').index(UPat.var('idx_y'), UPat.var('idx_x')),)), nload_img),
+    (UPat(Ops.MULACC, dtypes.floats, name="x"), lambda ctx,x: nalu(ctx.b, "ffma", *[ctx.r[s] for s in x.src])),
+    (UPat(Ops.MULACC, name="x"), lambda ctx,x:
+     nalu(ctx.b, aop[x.dtype][Ops.ADD], nalu(ctx.b, aop[x.dtype][Ops.MUL], ctx.r[x.src[0]], ctx.r[x.src[1]]), ctx.r[x.src[2]])),
   ]) + NIRRenderer.def_rewrite
 
   _param = LVPRenderer.param

@@ -194,14 +194,13 @@ def reduce_ranges_to_acc(ctx:itertools.count, r:UOp):
   input_ranges = tuple(x for x in r.src[0].ranges if x not in r.src[1:])
   acc_init = acc.after(*input_ranges).store(UOp.const(identity_element(r.arg[0], r.dtype)))
   acc_initted = acc.after(acc_init, *r.src[1:])
-  inp = r.src[0].reduce(arg=r.arg) if r.arg[1] else r.src[0]
-  acc_out = acc_initted.store(acc_initted.alu(r.arg[0], inp)).end(*r.src[1:]).rtag("mergeable")
+  vals = horizontal_vals(r.src[0], r.arg[1]) if r.arg[1] else [r.src[0]]
+  acc_out = acc_initted.store(functools.reduce(lambda x,y: x.alu(r.arg[0], y), vals, acc_initted)).end(*r.src[1:]).rtag("mergeable")
   return acc.after(acc_out)
 
-def expand_horizontal_reduce(r:UOp):
-  inp = r.src[0]
-  vals = [inp.index(*idx) for idx in itertools.product(*[range(inp.max_shape[a]) for a in range(r.arg[1])])]
-  return functools.reduce(lambda x,y: x.alu(r.arg[0], y), vals)
+def horizontal_vals(inp:UOp, axes:int) -> list[UOp]:
+  return [inp.index(*idx) for idx in itertools.product(*[range(inp.max_shape[a]) for a in range(axes)])]
+def expand_horizontal_reduce(r:UOp): return functools.reduce(lambda x,y: x.alu(r.arg[0], y), horizontal_vals(r.src[0], r.arg[1]))
 
 # an Invalid in a REDUCE source is that reduce's identity
 pm_reduce_identity = PatternMatcher([

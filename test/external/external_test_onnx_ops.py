@@ -72,8 +72,13 @@ class TestMainOnnxOps(TestOnnxOps):
     self.helper_test_single_op("Conv", {"X": a.reshape(1, 2, 1, 1), "W": b.reshape(1, 2, 1, 1), "B": c}, {}, ["Y"])
 
   def test_half_gelu_tanh(self):
-    x = np.array([0.2186279296875, 0.224609375, 0.236083984375, -0.353271484375, -1.5, 0.0], dtype=np.float16)
-    self.helper_test_single_op("Gelu", {"X": x}, {"approximate": "tanh"}, ["Y"], rtol=1e-4, atol=1e-4)
+    from tinygrad.nn.onnx import onnx_ops
+    x = np.arange(65536, dtype=np.uint16).view(np.float16)
+    x = x[np.isfinite(x)]
+    x64 = x.astype(np.float64)
+    truth = (0.5 * x64 * (1 + np.tanh(np.sqrt(2 / np.pi) * (x64 + 0.044715 * x64**3)))).astype(np.float16)
+    out = onnx_ops["Gelu"](Tensor(x), approximate="tanh").numpy()
+    self.assertLessEqual(np.max(np.abs(out.astype(np.float64) - truth.astype(np.float64)) / np.spacing(np.abs(truth))), 1)
 
   def test_half_bias_image_dtype(self):
     from tinygrad.nn.onnx import onnx_ops

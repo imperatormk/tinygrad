@@ -307,13 +307,13 @@ CAT2:dict[int, tuple[str, Callable]] = {
   mesa.OPC_MULL_U: ("u", lambda a, b: lo(a, 16) * lo(b, 16)), mesa.OPC_CLZ_B: ("u", clz), mesa.OPC_SETRM: ("u", ctz),
   mesa.OPC_SHL_B: ("u", lambda a, b: a << shamt(a, b)), mesa.OPC_SHR_B: ("u", lambda a, b: a >> shamt(a, b)),
   mesa.OPC_ASHR_B: ("i", lambda a, b: a >> shamt(a, b)), mesa.OPC_GETBIT_B: ("u", lambda a, b: (a >> shamt(a, b)) & a.dtype.type(1))}
-CAT3_HALF = {mesa.OPC_MAD_F16, mesa.OPC_SEL_B16, mesa.OPC_SEL_S16}
+CAT3_HALF = {mesa.OPC_MAD_F16, mesa.OPC_SEL_B16, mesa.OPC_SEL_S16, mesa.OPC_SEL_F16}
 CAT3:dict[int, tuple[str, Callable]] = {
   mesa.OPC_MADSH_M16: ("u", lambda a, b, c: (lo(a, 16) * (b >> 16) << 16) + c),
   mesa.OPC_MADSH_U16: ("u", lambda a, b, c: (lo(a, 16) * (b >> 16) << 16) + c), mesa.OPC_MAD_U16: ("u", lambda a, b, c: lo(a, 16) * lo(b, 16) + c),
   mesa.OPC_MAD_S24: ("u", lambda a, b, c: s24(a) * s24(b) + c),
   mesa.OPC_SEL_S32: ("i", lambda a, b, c: np.where(b >= 0, a, c)), mesa.OPC_SEL_S16: ("i", lambda a, b, c: np.where(b >= 0, a, c)),
-  mesa.OPC_SEL_F32: ("f", lambda a, b, c: np.where(b >= 0, a, c)),
+  mesa.OPC_SEL_F32: ("f", lambda a, b, c: np.where(b >= 0, a, c)), mesa.OPC_SEL_F16: ("f", lambda a, b, c: np.where(b >= 0, a, c)),
   mesa.OPC_MAD_F16: ("f", lambda a, b, c: ftz(a * b) + c), mesa.OPC_MAD_F32: ("f", lambda a, b, c: ftz(a * b) + c),
   mesa.OPC_SEL_B16: ("u", lambda a, b, c: np.where(b != 0, a, c)), mesa.OPC_SEL_B32: ("u", lambda a, b, c: np.where(b != 0, a, c)),
   mesa.OPC_SHRM: ("u", lambda a, b, c: (b >> shamt(b, a)) & c), mesa.OPC_SHRG: ("u", lambda a, b, c: (b >> shamt(b, a)) | c),
@@ -370,7 +370,7 @@ def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
     out = fn(*[t.read_alu(s, view(kind, s.half)) for s in srcs])
     if isinstance(i, Cat2) and i.ei:
       out = ((t.read(srcs[0], np.dtype(np.uint32)).astype(np.uint64) + t.read(srcs[1], np.dtype(np.uint32))) >> np.uint64(1)).astype(np.uint32)
-  out = ftz(out) if i.op == mesa.OPC_SEL_F32 else canonical_nan(ftz(out))
+  out = ftz(out) if i.op in (mesa.OPC_SEL_F32, mesa.OPC_SEL_F16) else canonical_nan(ftz(out))
   sat = i.sat and not (isinstance(i, Cat2) and i.op in CMPS)
   if sat:
     if i.op == mesa.OPC_SUB_U:

@@ -607,17 +607,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
   def softmax_13(x:Tensor, axis:int=-1): return x.softmax(axis)
   Softmax = {OpSetId(Domain.ONNX, 1):softmax_1, OpSetId(Domain.ONNX, 13):softmax_13}
   def HardSigmoid(x:Tensor, alpha:float=0.2, beta:float=0.5): return (alpha*x + beta).clip(0, 1)
-  def Gelu(x:Tensor, approximate:str|None=None):
-    if x.dtype == dtypes.half and approximate == "tanh":
-      # Keep intermediate precision and avoid cancellation in sigmoid-based tanh near zero.
-      xf = x.float()
-      t = math.sqrt(truncate[dtypes.float](2/math.pi)) * (xf + 0.044715 * xf**3)
-      small = t.clip(-0.5, 0.5)
-      z = small * small
-      # Pade [7/6] tanh on [-0.5, 0.5]; bound its argument to keep both branches finite.
-      rational = small * (135135 + z*(17325 + z*(378 + z))) / (135135 + z*(62370 + z*(3150 + 28*z)))
-      return (0.5*xf*(1 + (t.abs() <= 0.5).where(rational, t.tanh()))).half()
-    return x.gelu(approximate="none" if approximate is None else approximate)
+  def Gelu(x:Tensor, approximate:str|None=None): return x.gelu(approximate="none" if approximate is None else approximate)
   def BiasGelu(x: Tensor, bias: Tensor, approximate: str | None = None) -> Tensor: return Gelu(x + bias, approximate)
   def FastGelu(x:Tensor, bias:Tensor|None=None): return (x + bias).gelu() if bias is not None else x.gelu() # this is tanh approximated
   def PRelu(X:Tensor, slope:Tensor): return (X > 0).where(X, X * slope)

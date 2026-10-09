@@ -251,7 +251,8 @@ class ElementwiseMixin(CreationMixin):
       if rounding_mode == "floor": return a.alu(Ops.FLOORDIV, b)
     if dtypes.is_int(a.dtype) or a.dtype == dtypes.bool: a = a.cast(dtypes.default_float)
     # alu, not *: _broadcasted already promoted these, and a second promote would cast 1/b (only a weak CONST is kept weak)
-    d = a.alu(Ops.MUL, b.reciprocal())
+    if a.dtype == dtypes.half: d = a.cast(dtypes.float).alu(Ops.MUL, b.cast(dtypes.float).reciprocal()).cast(a.dtype)
+    else: d = a.alu(Ops.MUL, b.reciprocal())
     if rounding_mode is None: return d
     if rounding_mode == "trunc": return d.trunc()
     if rounding_mode == "floor": return d.floor()
@@ -784,8 +785,9 @@ class ElementwiseMixin(CreationMixin):
     print(Tensor([-3., -2., -1., 0., 1., 2., 3.]).gelu().numpy())
     ```
     """
+    if self.dtype == dtypes.half: return self.cast(dtypes.float).gelu(approximate).cast(self.dtype)
     if approximate == "tanh":
-      return 0.5 * self * (1 + (math.sqrt(2 / math.pi) * (self + 0.044715 * self ** 3)).tanh())
+      return self * (math.sqrt(8 / math.pi) * (self + 0.044715 * self ** 3)).sigmoid()
     elif approximate == "none":
       return self * 0.5 * (1.0 + (self / math.sqrt(2)).erf())
     else:

@@ -75,8 +75,7 @@ class TestQCOMEmu(unittest.TestCase):
   def test_dst_conv(self):
     a = Tensor(np.array([1 + 2**-11 + 2**-13, 1e5, 2**-15 + 2**-17], np.float32))
     out = (a * Tensor(np.ones(3, np.float32))).half().numpy()
-    expected = [0x3c01, 0x7c00, 0x0] if isinstance(Device.default.renderer, QCOMCLRenderer) else [0x3c00, 0x7bff, 0x0]
-    self.assertEqual(out.view(np.uint16).tolist(), expected)
+    self.assertEqual(out.view(np.uint16).tolist(), [0x3c01, 0x7c00, 0x0])
 
   @Context(IMAGE=1, FLOAT16=1)
   def test_cov(self):
