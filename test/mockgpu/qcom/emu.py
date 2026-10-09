@@ -1,6 +1,6 @@
 import ctypes, functools, math
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Callable, cast
 import numpy as np
 from tinygrad.helpers import Context, getbits, to_mv
 from tinygrad.runtime.autogen import mesa
@@ -23,7 +23,7 @@ def sext(x:int, n:int) -> int: return x - (1 << n) if x & (1 << (n - 1)) else x
 class Field:
   def __init__(self, lo:int, hi:int|None=None): self.lo, self.hi = lo, lo if hi is None else hi
   def __set_name__(self, owner, name): self.name = name
-  def __get__(self, i, owner=None) -> int:
+  def __get__(self, i, owner=None) -> int: # decoded once: the instance dict shadows this non-data descriptor
     i.__dict__[self.name] = v = getbits(i.word, self.lo, self.hi)
     return v
 
@@ -406,18 +406,20 @@ def exec_isams(t:Threads, insts:tuple[Cat5, ...]): # out of bounds reads the zer
     tex = int(idx[0])
   if tex >= len(t.d.textures): raise RuntimeError(f"pc {i.pc}: texture {tex} is not bound")
   if not i.s2en and (i.samp >= len(t.d.samplers) or not t.d.samplers[i.samp]): raise RuntimeError(f"pc {i.pc}: unsupported sampler {i.samp}")
-  img, dt = t.d.textures[tex], TYPES[i.type]
-  if not len(channels := wrmask_channels(i.wrmask)): return
-  if isinstance(t.h, np.ndarray) and img.dtype in TEX_DTYPES and dt in TEX_DTYPES and max(i.dst for i in insts) + len(channels) <= A0:
-    recs, tmp = np.array([(i.src1, i.dst) for i in insts], np.int32), np.empty(len(channels) * t.r.shape[1], dt)
-    return isam_kernel(img.dtype, dt, i.wrmask)(t.r.ctypes.data, t.mask.ctypes.data, img.addr, recs.ctypes.data, tmp.ctypes.data, t.h.ctypes.data,
-                                                n=t.r.shape[1], count=len(recs), w=img.width, h=img.height, pitch=img.pitch // img.dtype.itemsize)
-  for i in insts:
-    mem, ok, off = texels(img, t.r[i.src1], t.r[i.src1 + 1])
+  img, dt, channels = t.d.textures[tex], TYPES[i.type], wrmask_channels(i.wrmask)
+  if len(channels) == 0: return
+  if isinstance(t.h, np.ndarray) and img.dtype in TEX_DTYPES and dt in TEX_DTYPES and all(j.dst + len(channels) <= A0 for j in insts):
+    recs = np.array([(j.src1, j.dst) for j in insts], np.int32)
+    tmp = np.empty(len(channels) * t.r.shape[1], dt)
+    isam_kernel(img.dtype, dt, i.wrmask)(t.r.ctypes.data, t.mask.ctypes.data, img.addr, recs.ctypes.data, tmp.ctypes.data, t.h.ctypes.data,
+                                         n=t.r.shape[1], count=len(recs), width=img.width, height=img.height, pitch=img.pitch // img.dtype.itemsize)
+    return
+  for j in insts:
+    mem, ok, off = texels(img, t.r[j.src1], t.r[j.src1 + 1])
     values = mem.view(img.dtype)[off[:, None] // img.dtype.itemsize + channels]
     values[~ok] = 0
     values = values.astype(dt, copy=False)
-    for n in range(len(channels)): t.write(i.dst + n, dt == np.float16, values[:, n])
+    for n in range(len(channels)): t.write(j.dst + n, dt == np.float16, values[:, n])
 
 def exec_isam(t:Threads, i:Cat5, k:int): exec_isams(t, (i,))
 
@@ -428,105 +430,150 @@ def exec_ibo(t:Threads, i:Ibo, k:int): # out of bounds stores are dropped
   lanes, elems, regs = t.mask & ok, mem.view(img.dtype), t.h if dt == np.float16 else t.r
   for c in range(i.ncomp): elems[off[lanes] // img.dtype.itemsize + c] = regs[i.val + c].view(dt)[lanes].astype(img.dtype)
 
-MAX_BLOCK_LANES = 1 << 23 # reg * n + lane stays in int32
+BRANCHES = {mesa.OPC_JUMP, mesa.OPC_PREDT, mesa.OPC_PREDF, mesa.OPC_BR, mesa.OPC_BRAO, mesa.OPC_BRAA}
+JUMPS = BRANCHES | {mesa.OPC_CALL}
+
+def taken(t:Threads, i:Cat0) -> np.ndarray: # lanes that go to i.target
+  if i.op == mesa.OPC_JUMP: return t.everyone
+  if i.op in (mesa.OPC_PREDT, mesa.OPC_PREDF): return (t.r[P0] != 0) == (i.op == mesa.OPC_PREDF)
+  cond = (t.r[P0 + i.comp1] != 0) ^ bool(i.inv1)
+  if i.op == mesa.OPC_BRAO: cond |= (t.r[P0 + i.comp2] != 0) ^ bool(i.inv2)
+  if i.op == mesa.OPC_BRAA: cond &= (t.r[P0 + i.comp2] != 0) ^ bool(i.inv2)
+  return cond
+
+def is_nop(i:Inst|NotImplementedError) -> bool: return isinstance(i, Cat0) and i.op == mesa.OPC_NOP
+
+@functools.cache
+def block_starts(image:bytes, entry:int) -> set[int]: return {entry} | {i.target for i in decode(image) if isinstance(i, Cat0) and i.op in JUMPS}
+
+def straight_runs(prog:list, starts:set[int], key:Callable) -> list[tuple[int, int, list]]:
+  # runs of instructions with the same key, skipping nops and stopping at jump targets
+  runs, pc = [], 0
+  while pc < len(prog):
+    if (k := key(prog[pc])) is None:
+      pc += 1
+      continue
+    start, insts = pc, [prog[pc]]
+    pc += 1
+    while pc < len(prog) and pc not in starts and (is_nop(prog[pc]) or key(prog[pc]) == k):
+      if not is_nop(prog[pc]): insts.append(prog[pc])
+      pc += 1
+    runs.append((start, pc, insts))
+  return runs
+
+MAX_BLOCK_LANES = 2**23 # reg * n + lane stays in int32
+MAX_RECORDS = 2**16
+U32, LO16 = 2**32 - 1, 2**16 - 1
+def f32_bits(x:float) -> int: return int(np.float32(x).view(np.uint32))
+SIGN, INF, TINY, NAN = f32_bits(-0.0), f32_bits(np.inf), f32_bits(float(np.finfo(np.float32).tiny)), f32_bits(np.nan)
+
+def lane_params() -> tuple[UOp, UOp, UOp]:
+  r = UOp.param(0, dtypes.uint32, NREGS * MAX_BLOCK_LANES, name="r")
+  mask = UOp.param(1, dtypes.uint8, MAX_BLOCK_LANES, name="mask")
+  return r, mask, UOp.variable("n", 1, MAX_BLOCK_LANES)
+
+def cpu_kernel(body:UOp, name:str) -> Callable[..., None]:
+  with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0):
+    prg = to_program(UOp.sink(body, arg=KernelInfo(name=name)), Device['CPU'].renderer)
+  runtime, globals_, var_names = get_runtime('CPU', prg), prg.arg.globals, [v.expr for v in prg.arg.vars]
+  # called directly like the amd emulator does: the runtime's profiling and argument packing cost more than a small kernel
+  fxn = ctypes.CFUNCTYPE(None, *[ctypes.c_uint64] * (len(globals_) + len(var_names)))(runtime.addr)
+  return lambda *bufs, **vals: fxn(*[bufs[g] for g in globals_], *[vals[v] for v in var_names])
+
+def blend(active:UOp, new:UOp, old:UOp) -> UOp: # bitwise, since a where becomes a masked store, which is microcoded on x86
+  keep = active.cast(new.dtype) * new.dtype.max
+  return (new & keep) | (old & (keep ^ new.dtype.max))
+
+def ftz_f32(f:UOp) -> UOp:
+  u = f.bitcast(dtypes.uint32)
+  return ((u & (SIGN - 1)) < TINY).where(u & SIGN, u).bitcast(dtypes.float32)
+
+def canonical_nan_f32(f:UOp) -> UOp: # as uint32 bits
+  u = f.bitcast(dtypes.uint32)
+  return ((u & (SIGN - 1)) > INF).where(u.const_like(NAN), u)
+
 FMAD, IMAD, SHL, SHR, ASHR, AND, OR, XOR, SEL = range(9)
-ONE_F, NEG_ZERO, ONE, ZERO, ALL = (Src("i", v) for v in (0x3f800000, 0x80000000, 1, 0, 0xffffffff)) # x * 1 and x + -0 are exact
-LO, HI = 0xffff, 0xffff0000
-# opcode -> (kernel op, source kind, sources as an index or constant, optionally with an and mask). the mads compute src0 * src1 + src2
+ONE_F, NEG_ZERO, ONE, ZERO = (Src("i", v) for v in (f32_bits(1.0), SIGN, 1, 0))
+NEG_ONE = ALL_ONES = Src("i", U32)
+LO, HI = LO16, U32 ^ LO16
+# opcode -> (kernel op, kind, sources). the mads are src0 * src1 + src2, exact for x * 1, x + -0 and x * -1 + y
+# kind is how abs/neg apply: f on float bits, b as a bitwise not, u and i not at all
 BLOCK_OPS:dict[int, tuple[int, str, tuple]] = {
   mesa.OPC_MAD_F32: (FMAD, "f", (0, 1, 2)), mesa.OPC_ADD_F: (FMAD, "f", (0, ONE_F, 1)), mesa.OPC_MUL_F: (FMAD, "f", (0, 1, NEG_ZERO)),
-  mesa.OPC_MOV: (IMAD, "u", (0, ONE, ZERO)), mesa.OPC_ADD_U: (IMAD, "u", (0, ONE, 1)), mesa.OPC_ADD_S: (IMAD, "s", (0, ONE, 1)),
-  mesa.OPC_SUB_U: (IMAD, "u", (1, ALL, 0)), mesa.OPC_MULL_U: (IMAD, "u", ((0, LO), (1, LO), ZERO)),
+  mesa.OPC_MOV: (IMAD, "u", (0, ONE, ZERO)), mesa.OPC_ADD_U: (IMAD, "u", (0, ONE, 1)), mesa.OPC_ADD_S: (IMAD, "i", (0, ONE, 1)),
+  mesa.OPC_SUB_U: (IMAD, "u", (1, NEG_ONE, 0)), mesa.OPC_MULL_U: (IMAD, "u", ((0, LO), (1, LO), ZERO)),
   mesa.OPC_MADSH_M16: (IMAD, "u", ((0, LO), (1, HI), 2)), mesa.OPC_SHL_B: (SHL, "u", (0, 1, ZERO)), mesa.OPC_SHR_B: (SHR, "u", (0, 1, ZERO)),
-  mesa.OPC_ASHR_B: (ASHR, "s", (0, 1, ZERO)), mesa.OPC_AND_B: (AND, "b", (0, 1, ZERO)), mesa.OPC_OR_B: (OR, "b", (0, 1, ZERO)),
-  mesa.OPC_XOR_B: (XOR, "b", (0, 1, ZERO)), mesa.OPC_NOT_B: (XOR, "b", (0, ALL, ZERO)), mesa.OPC_SEL_B32: (SEL, "u", (0, 1, 2))}
+  mesa.OPC_ASHR_B: (ASHR, "i", (0, 1, ZERO)), mesa.OPC_AND_B: (AND, "b", (0, 1, ZERO)), mesa.OPC_OR_B: (OR, "b", (0, 1, ZERO)),
+  mesa.OPC_XOR_B: (XOR, "b", (0, 1, ZERO)), mesa.OPC_NOT_B: (XOR, "b", (0, ALL_ONES, ZERO)), mesa.OPC_SEL_B32: (SEL, "u", (0, 1, 2))}
 
 def block_source(spec:int|Src|tuple, srcs:list[Src], kind:str) -> tuple[int, int, int]|None: # (row, and, xor) applied as (r[row] & and) ^ xor
-  idx, mask = spec if isinstance(spec, tuple) else (spec, 0xffffffff)
+  idx, mask = spec if isinstance(spec, tuple) else (spec, U32)
   s = srcs[idx] if isinstance(idx, int) else idx
   if s.half or s.kind not in ("r", "i") or (s.kind == "r" and s.val >= A0): return None
-  if kind == "f": a, x = 0x7fffffff if s.absneg & 2 else 0xffffffff, 0x80000000 if s.absneg & 1 else 0
-  elif kind == "b": a, x = 0xffffffff, 0xffffffff if s.absneg & 1 else 0 # (neg) is a bitwise not
+  if kind == "f": a, x = SIGN - 1 if s.absneg & 2 else U32, SIGN if s.absneg & 1 else 0
+  elif kind == "b": a, x = U32, U32 if s.absneg & 1 else 0
   elif s.absneg & (1 if kind == "u" else 3): return None
-  else: a, x = 0xffffffff, 0
-  return (0, 0, (s.val & a & mask) ^ x) if s.kind == "i" else (s.val, a & mask, x)
+  else: a, x = U32, 0
+  if s.kind == "i": return 0, 0, (s.val & a & mask) ^ x # an immediate is row 0 masked to 0, the xor supplies the value
+  return s.val, a & mask, x
 
-def block_records(i:Inst|NotImplementedError) -> list[list[int]]|None:
+@functools.cache
+def block_records(i:Inst|NotImplementedError) -> tuple[tuple[int, ...], ...]|None:
   if not isinstance(i, (Cat1, Cat2, Cat3)) or i.op not in BLOCK_OPS or i.dst + i.iterations > A0: return None
   if isinstance(i, Cat1) and not (i.src_type == i.dst_type and i.src_type in (1, 3, 5)): return None
   if isinstance(i, (Cat2, Cat3)) and (i.sat or i.dst_conv or i.dst_half or getattr(i, "ei", 0)): return None
   op, kind, spec = BLOCK_OPS[i.op]
   recs = []
   for k, srcs in enumerate(i.repeat_srcs):
-    if len(sources := [s for x in spec if (s := block_source(x, srcs, kind)) is not None]) < 3: return None
-    recs.append([op, i.dst + k, *[s[f] for f in range(3) for s in sources]])
-  return recs
+    sources = [block_source(x, srcs, kind) for x in spec]
+    if None in sources: return None
+    rows, ands, xors = zip(*cast(list[tuple[int, int, int]], sources))
+    recs.append((op, i.dst + k, *rows, *ands, *xors))
+  return tuple(recs)
 
 @dataclass(frozen=True)
 class AluBlock:
   end:int
-  records:np.ndarray # uint32 (op, dst, row0, row1, row2, and0, and1, and2, xor0, xor1, xor2) per instruction
-  ops:tuple[int, ...]
-
-@functools.cache
-def block_starts(image:bytes, entry:int) -> set[int]: return {entry} | {i.target for i in decode(image) if isinstance(i, Cat0) and i.op in JUMPS}
+  records:np.ndarray # uint32 (op, dst, 3 source rows, 3 and masks, 3 xors) per instruction
+  kernel_ops:tuple[int, ...]
 
 @functools.cache
 def alu_blocks(image:bytes, entry:int) -> dict[int, AluBlock]:
-  prog, blocks, pc, starts = decode(image), {}, 0, block_starts(image, entry)
-  while pc < len(prog):
-    if block_records(prog[pc]) is None:
-      pc += 1
-      continue
-    start, recs = pc, []
-    while pc < len(prog) and (pc == start or pc not in starts):
-      if not (isinstance(i := prog[pc], Cat0) and i.op == mesa.OPC_NOP):
-        if (r := block_records(i)) is None: break
-        recs += r
-      pc += 1
-    assert len(recs) < 1 << 16, f"pc {start}: alu block too long"
-    ops = {rec[0] for rec in recs}
-    blocks[start] = AluBlock(pc, np.array(recs, np.uint32), (FMAD,) if ops == {FMAD} else tuple(range(FMAD if FMAD in ops else IMAD, SEL + 1)))
+  blocks = {}
+  for start, end, insts in straight_runs(decode(image), block_starts(image, entry), lambda i: True if block_records(i) is not None else None):
+    recs = [rec for i in insts for rec in block_records(i) or ()]
+    assert len(recs) < MAX_RECORDS, f"pc {start}: alu block too long"
+    used = {rec[0] for rec in recs}
+    kernel_ops = (FMAD,) if used == {FMAD} else tuple(range(FMAD if FMAD in used else IMAD, SEL + 1))
+    blocks[start] = AluBlock(end, np.array(recs, np.uint32), kernel_ops)
   return blocks
 
-def uop_ftz(u:UOp) -> UOp: return ((u & 0x7fffffff) < 0x00800000).where(u & 0x80000000, u)
-def uop_result(f:UOp) -> UOp:
-  u = uop_ftz(f.bitcast(dtypes.uint32))
-  return ((u & 0x7fffffff) > 0x7f800000).where(u.const_like(0x7fc00000), u)
-
-def lane_params() -> tuple[UOp, UOp, UOp]:
-  return UOp.param(0, dtypes.uint32, NREGS * MAX_BLOCK_LANES, name="r"), UOp.param(1, dtypes.uint8, MAX_BLOCK_LANES, name="mask"), \
-    UOp.variable("n", 1, MAX_BLOCK_LANES)
-
-def cpu_kernel(ended:UOp, name:str) -> Callable[..., None]:
-  with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0):
-    prg = to_program(UOp.sink(ended, arg=KernelInfo(name=name)), Device['CPU'].renderer)
-  runtime, globals_, names = get_runtime('CPU', prg), prg.arg.globals, [v.expr for v in prg.arg.vars]
-  # called directly like the amd emulator does: the runtime's profiling and argument packing cost more than a small kernel
-  fxn = ctypes.CFUNCTYPE(None, *[ctypes.c_uint64] * (len(globals_) + len(names)))(runtime.addr)
-  return lambda *bufs, **vals: fxn(*[bufs[g] for g in globals_], *[vals[v] for v in names])
-
 @functools.cache
-def alu_kernel(ops:tuple[int, ...]) -> Callable[..., None]: # only the ops a block uses, so float blocks stay cheap
-  (r, mask, n), count = lane_params(), UOp.variable("count", 1, 1 << 16)
-  recs, k, lane = UOp.param(2, dtypes.uint32, 11 << 16, name="recs"), UOp.range(count, 0), UOp.range(n, 1)
-  op, *rec = [recs.index(k * 11 + j).load() for j in range(11)]
-  a, b, c = [(r.index(rec[1 + j].cast(dtypes.int32) * n + lane).load() & rec[4 + j]) ^ rec[7 + j] for j in range(3)]
-  fa, fb, fc, amt = *[uop_ftz(x).bitcast(dtypes.float32) for x in (a, b, c)], b & 31
-  outs = [uop_result(uop_ftz((fa * fb).bitcast(dtypes.uint32)).bitcast(dtypes.float32) + fc), a * b + c, a << amt, a >> amt,
-          (a.bitcast(dtypes.int32) >> amt.bitcast(dtypes.int32)).bitcast(dtypes.uint32), a & b, a | b, a ^ b, b.ne(0).where(a, c)]
-  out = functools.reduce(lambda acc, o: op.eq(o).where(outs[o], acc), ops[1:], outs[ops[0]])
+def alu_kernel(kernel_ops:tuple[int, ...]) -> Callable[..., None]:
+  r, mask, n = lane_params()
+  recs = UOp.param(2, dtypes.uint32, 11 * MAX_RECORDS, name="recs")
+  tmp = UOp.param(3, dtypes.uint32, MAX_BLOCK_LANES, name="tmp")
+  count = UOp.variable("count", 1, MAX_RECORDS)
+  k, lane, lane2 = UOp.range(count, 0), UOp.range(n, 1), UOp.range(n, 2)
+  rec = [recs.index(k * 11 + j).load() for j in range(11)]
+  op, dst, rows, ands, xors = rec[0], rec[1], rec[2:5], rec[5:8], rec[8:11]
+  a, b, c = [(r.index(row.cast(dtypes.int32) * n + lane).load() & m) ^ x for row, m, x in zip(rows, ands, xors)]
+  fa, fb, fc = [ftz_f32(x.bitcast(dtypes.float32)) for x in (a, b, c)]
+  amt = b & 31
+  outs = {FMAD: canonical_nan_f32(ftz_f32(ftz_f32(fa * fb) + fc)), # the product is flushed too, like ftz(a * b) + c in CAT3
+          IMAD: a * b + c, SHL: a << amt, SHR: a >> amt, ASHR: (a.bitcast(dtypes.int32) >> amt.bitcast(dtypes.int32)).bitcast(dtypes.uint32),
+          AND: a & b, OR: a | b, XOR: a ^ b, SEL: b.ne(0).where(a, c)}
+  out = outs[kernel_ops[0]]
+  for o in kernel_ops[1:]: out = op.eq(o).where(outs[o], out)
   # through a scratch row: a destination that is also a source (r = a * b + r) would fail clang's overlap check and run scalar
-  tmp, lane2 = UOp.param(3, dtypes.uint32, MAX_BLOCK_LANES, name="tmp"), UOp.range(n, 2)
   computed = tmp.index(lane).store(out).end(lane)
-  dst, keep = r.index(rec[0].cast(dtypes.int32) * n + lane2), mask.index(lane2).load().cast(dtypes.uint32) * 0xffffffff
-  value = tmp.after(computed).index(lane2).load()
-  store = dst.store((value & keep) | (dst.load() & (keep ^ 0xffffffff))) # a blend instead of a masked store, which is microcoded on x86
-  return cpu_kernel(store.end(lane2).end(k), "qcom_alu_" + "_".join(map(str, ops)))
+  reg = r.index(dst.cast(dtypes.int32) * n + lane2)
+  store = reg.store(blend(mask.index(lane2).load(), tmp.after(computed).index(lane2).load(), reg.load()))
+  return cpu_kernel(store.end(lane2).end(k), "qcom_alu_" + "_".join(map(str, kernel_ops)))
 
 def exec_block(t:Threads, b:AluBlock):
   tmp = np.empty(t.r.shape[1], np.uint32)
-  alu_kernel(b.ops)(t.r.ctypes.data, t.mask.ctypes.data, b.records.ctypes.data, tmp.ctypes.data, n=len(tmp), count=len(b.records))
+  alu_kernel(b.kernel_ops)(t.r.ctypes.data, t.mask.ctypes.data, b.records.ctypes.data, tmp.ctypes.data, n=len(tmp), count=len(b.records))
 
 TEX_DTYPES = {np.dtype(np.float16): dtypes.half, np.dtype(np.float32): dtypes.float32}
 
@@ -540,45 +587,38 @@ class IsamRun:
 
 @functools.cache
 def isam_runs(image:bytes, entry:int) -> dict[int, IsamRun]: # consecutive isams that one kernel call can do
-  prog, runs, pc, starts = decode(image), {}, 0, block_starts(image, entry)
   def key(i) -> tuple|None: return (i.tex, i.samp, i.type, i.wrmask) if isinstance(i, Cat5) and not i.s2en else None
-  while pc < len(prog):
-    if not isinstance(i := prog[pc], Cat5) or (first := key(i)) is None:
-      pc += 1
-      continue
-    start, insts = pc, [i]
-    while (pc := pc + 1) < len(prog) and pc not in starts and (key(i := prog[pc]) == first or (isinstance(i, Cat0) and i.op == mesa.OPC_NOP)):
-      if isinstance(i, Cat5): insts.append(i)
-    if len(insts) > 1: runs[start] = IsamRun(pc, tuple(insts))
+  runs = {}
+  for start, end, insts in straight_runs(decode(image), block_starts(image, entry), key):
+    assert len(insts) < MAX_RECORDS, f"pc {start}: isam run too long"
+    if len(insts) > 1: runs[start] = IsamRun(end, tuple(insts))
   return runs
 
 @functools.cache
 def isam_kernel(img_dt:np.dtype, dt:np.dtype, wrmask:int) -> Callable[..., None]:
-  (r, mask, n), bits, ones = lane_params(), *((dtypes.uint32, 0xffffffff) if dt == np.float32 else (dtypes.uint16, 0xffff))
-  img, recs = UOp.param(2, TEX_DTYPES[img_dt], 1 << 30, name="img"), UOp.param(3, dtypes.int32, 2 << 16, name="recs")
-  tmp, out = UOp.param(4, bits, 4 * MAX_BLOCK_LANES, name="tmp"), r if dt == np.float32 else UOp.param(5, bits, NREGS * MAX_BLOCK_LANES, name="h")
-  count, w, h, pitch = [UOp.variable(v, 0, 1 << 24) for v in ("count", "w", "h", "pitch")]
-  k, lane, lane2, chans = UOp.range(count, 0), UOp.range(n, 1), UOp.range(n, 2), wrmask_channels(wrmask).tolist()
+  r, mask, n = lane_params()
+  bits = dtypes.uint32 if dt == np.float32 else dtypes.uint16
+  img = UOp.param(2, TEX_DTYPES[img_dt], 2**30, name="img")
+  recs = UOp.param(3, dtypes.int32, 2 * MAX_RECORDS, name="recs")
+  tmp = UOp.param(4, bits, 4 * MAX_BLOCK_LANES, name="tmp")
+  out = r if dt == np.float32 else UOp.param(5, bits, NREGS * MAX_BLOCK_LANES, name="half")
+  count = UOp.variable("count", 1, MAX_RECORDS)
+  width, height, pitch = [UOp.variable(v, 0, 2**24) for v in ("width", "height", "pitch")]
+  k, lane, lane2 = UOp.range(count, 0), UOp.range(n, 1), UOp.range(n, 2)
   src1, dst = recs.index(k * 2).load(), recs.index(k * 2 + 1).load()
   x, y = r.index(src1 * n + lane).load(), r.index((src1 + 1) * n + lane).load()
-  ok, base = (x < w.cast(dtypes.uint32)) & (y < h.cast(dtypes.uint32)), y.cast(dtypes.int32) * pitch + x.cast(dtypes.int32) * 4
-  texels = UOp.group(*[tmp.index(j * n + lane).store(ok.where(img.index(ok.where(base + c, 0)).load(), 0).cast(TEX_DTYPES[dt]).bitcast(bits))
-                       for j, c in enumerate(chans)]).end(lane)
-  keep, stores = mask.index(lane2).load().cast(bits) * ones, []
-  for j in range(len(chans)): # through scratch rows, like the alu blocks
+  inside = (x < width.cast(dtypes.uint32)) & (y < height.cast(dtypes.uint32))
+  base = y.cast(dtypes.int32) * pitch + x.cast(dtypes.int32) * 4
+  gathered = []
+  for j, c in enumerate(wrmask_channels(wrmask).tolist()):
+    texel = img.index(inside.where(base + c, 0)).load() # every lane loads, so clamp into the image
+    gathered.append(tmp.index(j * n + lane).store(inside.where(texel, 0).cast(TEX_DTYPES[dt]).bitcast(bits)))
+  done, active = UOp.group(*gathered).end(lane), mask.index(lane2).load()
+  stores = []
+  for j in range(len(gathered)):
     reg = out.index((dst + j) * n + lane2)
-    stores.append(reg.store((tmp.after(texels).index(j * n + lane2).load() & keep) | (reg.load() & (keep ^ ones))))
+    stores.append(reg.store(blend(active, tmp.after(done).index(j * n + lane2).load(), reg.load())))
   return cpu_kernel(UOp.group(*stores).end(lane2).end(k), "qcom_isam")
-
-def taken(t:Threads, i:Cat0) -> np.ndarray: # lanes that go to i.target
-  if i.op == mesa.OPC_JUMP: return t.everyone
-  if i.op in (mesa.OPC_PREDT, mesa.OPC_PREDF): return (t.r[P0] != 0) == (i.op == mesa.OPC_PREDF)
-  cond = (t.r[P0 + i.comp1] != 0) ^ bool(i.inv1)
-  if i.op == mesa.OPC_BRAO: cond |= (t.r[P0 + i.comp2] != 0) ^ bool(i.inv2)
-  if i.op == mesa.OPC_BRAA: cond &= (t.r[P0 + i.comp2] != 0) ^ bool(i.inv2)
-  return cond
-BRANCHES = {mesa.OPC_JUMP, mesa.OPC_PREDT, mesa.OPC_PREDF, mesa.OPC_BR, mesa.OPC_BRAO, mesa.OPC_BRAA}
-JUMPS = BRANCHES | {mesa.OPC_CALL}
 
 EXEC:dict[type, Callable] = {Cat1: exec_mov, Cat2: exec_alu, Cat3: exec_alu, Cat4: exec_alu, Cat5: exec_isam, Ibo: exec_ibo, Ldg: exec_mem,
                              Stg: exec_mem, Load: exec_mem, Store: exec_mem}
@@ -608,22 +648,21 @@ def run(d:Dispatch):
         cur = int(pc[live].min()) # lowest pc first, so paths reconverge and nobody passes a bar early
         t.mask = (pc == cur) & ~done
       if isinstance(i := prog[cur], NotImplementedError): raise i
+      nxt:int|None = None
       if (b := blocks.get(cur)) is not None:
         if isinstance(b, AluBlock): exec_block(t, b)
         else: exec_isams(t, b.insts)
-        if together is not None: together = b.end
-        else: pc[t.mask] = b.end
-        continue
-      if (fn := EXEC.get(type(i))) is not None:
+        nxt = b.end
+      elif (fn := EXEC.get(type(i))) is not None:
         for k in range(i.iterations): fn(t, i, k)
-        if together is not None: together = cur + 1
-        else: pc[t.mask] = cur + 1
+        nxt = cur + 1
+      elif together is not None and is_nop(i): nxt = cur + 1
+      elif together is not None and isinstance(i, Cat0) and i.op in BRANCHES and ((go := taken(t, i)).all() or not go.any()):
+        nxt = i.target if go.all() else cur + 1 # a uniform branch stays together
+      if nxt is not None:
+        if together is not None: together = nxt
+        else: pc[t.mask] = nxt
         continue
-      if together is not None and isinstance(i, Cat0) and i.op in BRANCHES | {mesa.OPC_NOP}:
-        go = taken(t, i) if i.op != mesa.OPC_NOP else np.zeros(1, bool)
-        if go.all() or not go.any(): # a uniform branch stays together
-          together = i.target if go.all() else cur + 1
-          continue
       if together is not None: pc[:], together = cur, None
       pc[t.mask] = cur + 1
       if isinstance(i, Cat7) and i.op == mesa.OPC_BAR:
