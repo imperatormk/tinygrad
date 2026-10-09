@@ -1,4 +1,4 @@
-import functools, math
+import ctypes, functools, math
 from dataclasses import dataclass, replace
 from typing import Callable
 import numpy as np
@@ -501,8 +501,10 @@ def lane_params() -> tuple[UOp, UOp, UOp]:
 def cpu_kernel(ended:UOp, name:str) -> Callable[..., None]:
   with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0):
     prg = to_program(UOp.sink(ended, arg=KernelInfo(name=name)), Device['CPU'].renderer)
-  runtime, names = get_runtime('CPU', prg), [v.expr for v in prg.arg.vars]
-  return lambda *bufs, **vals: runtime(*[bufs[g] for g in prg.arg.globals], vals=tuple(vals[v] for v in names))
+  runtime, globals_, names = get_runtime('CPU', prg), prg.arg.globals, [v.expr for v in prg.arg.vars]
+  # called directly like the amd emulator does: the runtime's profiling and argument packing cost more than a small kernel
+  fxn = ctypes.CFUNCTYPE(None, *[ctypes.c_uint64] * (len(globals_) + len(names)))(runtime.addr)
+  return lambda *bufs, **vals: fxn(*[bufs[g] for g in globals_], *[vals[v] for v in names])
 
 @functools.cache
 def alu_kernel(ops:tuple[int, ...]) -> Callable[..., None]: # only the ops a block uses, so float blocks stay cheap
