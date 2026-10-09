@@ -1,0 +1,43 @@
+name: QCOM openpilot models
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [qcom-a630-models-only]
+    paths: [.github/workflows/qcom-models.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  models:
+    name: openpilot (${{ matrix.renderer }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        renderer: [IR3, CL]
+    env:
+      DEV: MOCK+QCOM:${{ matrix.renderer }}
+      PYTHONPATH: .
+      LFS_SHA: "51b12d20a25b76fa8a5717c2e5af01f148e469e2"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-tinygrad
+        with:
+          key: qcom-minimal-${{ matrix.renderer }}
+          deps: "testing_unit mesa"
+          pydeps: "onnxruntime==1.24.1"
+          qemu: ${{ matrix.renderer == 'CL' }}
+      - name: Runner CPU
+        run: lscpu | grep -E "Model name|^CPU\(s\)|Flags" | cut -c1-200
+      - name: Test openpilot models
+        env:
+          BEAM_MAX_TASKS_PER_CHILD: 1024
+        run: |
+          for model in dmonitoring_model driving_supercombo; do
+            onnx="https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx"
+            IMAGE=1 FLOAT16=1 python examples/openpilot/compile_onnx.py "$onnx" /tmp/openpilot.pkl --benchmark-runs 1
+            IMAGE=1 FLOAT16=1 MODEL_ONNX="$onnx" MODEL_PKL=/tmp/openpilot.pkl python -m pytest test/external/external_test_compile.py -k test_onnx
+          done
