@@ -1,11 +1,16 @@
-import ctypes, struct, platform, pathlib, shutil
+import ctypes, struct, platform, pathlib, shutil, functools
 from tinygrad.device import Compiler
-from tinygrad.helpers import DEBUG, system, fetch
+from tinygrad.helpers import DEBUG, CCACHE, system, fetch
 from tinygrad.runtime.support.compiler_mesa import disas_adreno
 # see https://github.com/sirhcm/tinydreno
 from tinygrad.runtime.autogen import llvm_qcom
 
 def _read_lib(lib, off) -> int: return struct.unpack("I", lib[off:off+4])[0]
+
+# one qemu per process; CCACHE is part of the key because Compiler reads it at init
+def qcom_compiler(arch:str) -> "QCOMCompiler": return _qcom_compiler(arch, bool(CCACHE))
+@functools.cache
+def _qcom_compiler(arch:str, ccache:bool) -> "QCOMCompiler": return QCOMCompiler(arch)
 
 class QCOMCompiler(Compiler):
   def __init__(self, arch:str):

@@ -612,8 +612,8 @@ class HIPCCRenderer(HIPRenderer):
 class QCOMCLRenderer(OpenCLRenderer):
   def __init__(self, target:Target):
     super().__init__(target)
-    from tinygrad.runtime.support.compiler_qcom import QCOMCompiler
-    self.compiler = QCOMCompiler(target.arch)
+    from tinygrad.runtime.support.compiler_qcom import qcom_compiler
+    self.compiler = qcom_compiler(target.arch)
 
   # QCOM compiler is flaky with half
   def supported_dtypes(self):
