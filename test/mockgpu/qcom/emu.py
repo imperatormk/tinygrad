@@ -2,8 +2,13 @@ import functools, math
 from dataclasses import dataclass, replace
 from typing import Callable
 import numpy as np
-from tinygrad.helpers import getbits, to_mv
+from tinygrad.helpers import Context, getbits, to_mv
 from tinygrad.runtime.autogen import mesa
+from tinygrad.uop.ops import UOp, KernelInfo
+from tinygrad.dtype import dtypes
+from tinygrad.device import Device
+from tinygrad.engine.realize import get_runtime
+from tinygrad.codegen import to_program
 
 NREGS = 64 * 4 # regid = gpr*4 + component
 A0, P0 = 61 * 4, 62 * 4
@@ -11,12 +16,16 @@ TYPES = [np.dtype(t) for t in ("f2", "f4", "u2", "u4", "i2", "i4", "u1", "i1")] 
 HALF_TYPES = (0, 2, 4, 6, 7)
 FLUT = [0.0, 0.5, 1.0, 2.0, math.e, math.pi, 1/math.pi, 1/math.log2(math.e), math.log2(math.e), 1/math.log2(10), math.log2(10), 4.0]
 
+@functools.cache
 def view(kind:str, half:bool) -> np.dtype: return np.dtype(f"{kind}{2 if half else 4}")
 def sext(x:int, n:int) -> int: return x - (1 << n) if x & (1 << (n - 1)) else x
 
 class Field:
   def __init__(self, lo:int, hi:int|None=None): self.lo, self.hi = lo, lo if hi is None else hi
-  def __get__(self, i, owner=None) -> int: return getbits(i.word, self.lo, self.hi)
+  def __set_name__(self, owner, name): self.name = name
+  def __get__(self, i, owner=None) -> int:
+    i.__dict__[self.name] = v = getbits(i.word, self.lo, self.hi)
+    return v
 
 @dataclass(frozen=True)
 class Src:
@@ -45,6 +54,8 @@ class Inst:
     self.pc, self.word = pc, word
     self.op, self.iterations = self.cat << 7 | self.opc, self.repeat + 1
   def error(self): return NotImplementedError(f"pc {self.pc}: {mesa.opc_t.get(self.op, self.op)} is not emulated {self.word:#x}")
+  @functools.cached_property
+  def repeat_srcs(self) -> list[list[Src]]: return [[s.at(k) for s in self.srcs] for k in range(self.iterations)]
 
 class Cat0(Inst):
   immed, brtype, inv2, comp2 = Field(0, 31), Field(37, 39), Field(45), Field(46, 47)
@@ -304,21 +315,26 @@ def exec_mov(t:Threads, i:Cat1, k:int):
     for d, v in zip(i.dsts, vals): t.write(d, i.dst_type in HALF_TYPES, v)
     return
   src_dt, dst_dt = TYPES[i.src_type], TYPES[i.dst_type]
-  v = t.read(i.srcs[0].at(k), src_dt)
+  v = t.read(i.repeat_srcs[k][0], src_dt)
   if i.src_type in (6, 7): v = v.view(np.int8) # cov from u8 sign-extends
   if v.dtype.kind == "f" and dst_dt.kind != "f":
     v = np.clip(np.trunc(np.nan_to_num(v.astype(np.float64))), np.iinfo(dst_dt).min, np.iinfo(dst_dt).max)
   elif dst_dt.kind == "f" and v.dtype != dst_dt: v = cov_to_float(v, dst_dt, even=i.round == 1)
-  t.write(i.dst + k, i.dst_type in HALF_TYPES, v.astype(dst_dt))
+  t.write(i.dst + k, i.dst_type in HALF_TYPES, v.astype(dst_dt, copy=False))
+
+@functools.cache
+def float_tiny(dt:np.dtype): return np.finfo(dt).tiny
 
 def ftz(v): # float alu flushes denormal sources and results, cov doesn't
-  return np.where(np.abs(v) < np.finfo(v.dtype).tiny, np.copysign(v.dtype.type(0), v), v) if v.dtype.kind == "f" else v
+  if v.dtype.kind != "f" or not (mask := np.abs(v) < float_tiny(v.dtype)).any(): return v
+  return np.where(mask, np.copysign(v.dtype.type(0), v), v)
 
 def canonical_nan(v):
-  return np.where(np.isnan(v), v.dtype.type(np.nan), v) if v.dtype.kind == "f" else v
+  if v.dtype.kind != "f" or not (mask := np.isnan(v)).any(): return v
+  return np.where(mask, v.dtype.type(np.nan), v)
 
 def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
-  srcs = [s.at(k) for s in i.srcs]
+  srcs = i.repeat_srcs[k]
   if isinstance(i, Cat2) and i.op in CMPS:
     out = COND[i.cond](*[ftz(t.read(s, view(CMPS[i.op], s.half))) for s in srcs]).astype(view("u", srcs[0].half))
     if i.sat: out = out ^ out.dtype.type(1)
@@ -390,19 +406,105 @@ def exec_isam(t:Threads, i:Cat5, k:int): # out of bounds reads the zero border c
   if tex >= len(t.d.textures): raise RuntimeError(f"pc {i.pc}: texture {tex} is not bound")
   if not i.s2en and (i.samp >= len(t.d.samplers) or not t.d.samplers[i.samp]): raise RuntimeError(f"pc {i.pc}: unsupported sampler {i.samp}")
   img, dt = t.d.textures[tex], TYPES[i.type]
+  if not len(channels := wrmask_channels(i.wrmask)): return
+  if isinstance(t.h, np.ndarray) and img.dtype in TEX_DTYPES and dt in TEX_DTYPES and i.dst + len(channels) <= A0:
+    return isam_kernel(img.dtype, dt)(t.r.ctypes.data, t.mask.ctypes.data, img.addr, channels.ctypes.data, t.h.ctypes.data, n=t.r.shape[1],
+                                      src1=i.src1, dst=i.dst, nchan=len(channels), w=img.width, h=img.height, pitch=img.pitch // img.dtype.itemsize)
   mem, ok, off = texels(img, t.r[i.src1], t.r[i.src1 + 1])
-  for n, c in enumerate(c for c in range(4) if i.wrmask >> c & 1):
-    v = mem[off[:, None] + c * img.dtype.itemsize + np.arange(img.dtype.itemsize)].copy().view(img.dtype).reshape(-1)
-    t.write(i.dst + n, dt == np.float16, np.where(ok, v, 0).astype(dt))
+  values = mem.view(img.dtype)[off[:, None] // img.dtype.itemsize + channels]
+  values[~ok] = 0
+  values = values.astype(dt, copy=False)
+  for n in range(len(channels)): t.write(i.dst + n, dt == np.float16, values[:, n])
 
 def exec_ibo(t:Threads, i:Ibo, k:int): # out of bounds stores are dropped
   if i.ssbo >= len(t.d.ibos): raise RuntimeError(f"pc {i.pc}: IBO {i.ssbo} is not bound")
   img, dt = t.d.ibos[i.ssbo], TYPES[i.type]
   mem, ok, off = texels(img, t.r[i.coord], t.r[i.coord + 1])
-  lanes, esz = t.mask & ok, img.dtype.itemsize
-  for c in range(i.ncomp):
-    v = (t.h if dt == np.float16 else t.r)[i.val + c].view(dt).astype(img.dtype)
-    mem[off[lanes][:, None] + c * esz + np.arange(esz)] = v[lanes].view(np.uint8).reshape(-1, esz)
+  lanes, elems, regs = t.mask & ok, mem.view(img.dtype), t.h if dt == np.float16 else t.r
+  for c in range(i.ncomp): elems[off[lanes] // img.dtype.itemsize + c] = regs[i.val + c].view(dt)[lanes].astype(img.dtype)
+
+FAST_ALU = (mesa.OPC_ADD_F, mesa.OPC_MUL_F, mesa.OPC_MAD_F32)
+MAX_BLOCK_LANES = 1 << 23 # reg * n + lane stays in int32
+
+def fast_alu(i:Inst|NotImplementedError) -> bool:
+  return isinstance(i, (Cat2, Cat3)) and i.op in FAST_ALU and not (i.sat or i.dst_conv or i.dst_half) and i.dst + i.iterations <= A0 and \
+    all(s.kind == "r" and not s.half and s.val < A0 for srcs in i.repeat_srcs for s in srcs)
+
+@dataclass(frozen=True)
+class AluBlock:
+  end:int
+  dsts:tuple[int, ...]
+  records:np.ndarray # int32 (op, dst, src0, src1, src2, absneg0, absneg1, absneg2) per instruction
+
+@functools.cache
+def alu_blocks(image:bytes, entry:int) -> dict[int, AluBlock]:
+  prog, blocks, pc = decode(image), {}, 0
+  starts = {entry} | {i.target for i in prog if isinstance(i, Cat0)}
+  while pc < len(prog):
+    if not fast_alu(prog[pc]):
+      pc += 1
+      continue
+    start, recs = pc, []
+    while pc < len(prog) and isinstance(i := prog[pc], (Cat2, Cat3)) and fast_alu(i) and (pc == start or pc not in starts):
+      for k in range(i.iterations):
+        srcs = (i.repeat_srcs[k] * 3)[:3] # pad to 3 sources
+        recs.append([FAST_ALU.index(i.op), i.dst + k, *[s.val for s in srcs], *[s.absneg for s in srcs]])
+      pc += 1
+    assert len(recs) < 1 << 16, f"pc {start}: alu block too long"
+    blocks[start] = AluBlock(pc, tuple(sorted({rec[1] for rec in recs})), np.array(recs, np.int32))
+  return blocks
+
+def uop_ftz(u:UOp) -> UOp: return ((u & 0x7fffffff) < 0x00800000).where(u & 0x80000000, u)
+def uop_result(f:UOp) -> UOp:
+  u = uop_ftz(f.bitcast(dtypes.uint32))
+  return ((u & 0x7fffffff) > 0x7f800000).where(u.const_like(0x7fc00000), u)
+
+def lane_params() -> tuple[UOp, UOp, UOp]:
+  return UOp.param(0, dtypes.uint32, NREGS * MAX_BLOCK_LANES, name="r"), UOp.param(1, dtypes.uint8, MAX_BLOCK_LANES, name="mask"), \
+    UOp.variable("n", 1, MAX_BLOCK_LANES)
+
+def cpu_kernel(ended:UOp, name:str) -> Callable[..., None]:
+  with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0):
+    prg = to_program(UOp.sink(ended, arg=KernelInfo(name=name)), Device['CPU'].renderer)
+  runtime, names = get_runtime('CPU', prg), [v.expr for v in prg.arg.vars]
+  return lambda *bufs, **vals: runtime(*[bufs[g] for g in prg.arg.globals], vals=tuple(vals[v] for v in names))
+
+@functools.cache
+def alu_kernel() -> Callable[..., None]:
+  (r, mask, n), count = lane_params(), UOp.variable("count", 1, 1 << 16)
+  recs, k, lane = UOp.param(2, dtypes.int32, 8 << 16, name="recs"), UOp.range(count, 0), UOp.range(n, 1)
+  rec = [recs.index(k * 8 + j).load() for j in range(8)]
+  def read(j:int) -> UOp:
+    u = r.index(rec[2 + j] * n + lane).load()
+    u = (rec[5 + j] & 2).ne(0).where(u & 0x7fffffff, u)
+    u = (rec[5 + j] & 1).ne(0).where(u ^ 0x80000000, u)
+    return uop_ftz(u).bitcast(dtypes.float32)
+  a, b, c = read(0), read(1), read(2)
+  mad = uop_result(uop_ftz((a * b).bitcast(dtypes.uint32)).bitcast(dtypes.float32) + c)
+  out = rec[0].eq(0).where(uop_result(a + b), rec[0].eq(1).where(uop_result(a * b), mad))
+  store = r.index((rec[1] * n + lane).valid(mask.index(lane).load().ne(0))).store(out)
+  return cpu_kernel(store.end(lane).end(k), "qcom_alu")
+
+def exec_block(t:Threads, b:AluBlock):
+  alu_kernel()(t.r.ctypes.data, t.mask.ctypes.data, b.records.ctypes.data, n=t.r.shape[1], count=len(b.records))
+
+TEX_DTYPES = {np.dtype(np.float16): dtypes.half, np.dtype(np.float32): dtypes.float32}
+
+@functools.cache
+def wrmask_channels(wrmask:int) -> np.ndarray: return np.array([c for c in range(4) if wrmask >> c & 1], np.int32)
+
+@functools.cache
+def isam_kernel(img_dt:np.dtype, dt:np.dtype) -> Callable[..., None]:
+  r, mask, n = lane_params()
+  img, chans = UOp.param(2, TEX_DTYPES[img_dt], 1 << 30, name="img"), UOp.param(3, dtypes.int32, 4, name="chans")
+  src1, dst, nchan, w, h, pitch = [UOp.variable(v, 0, 1 << 24) for v in ("src1", "dst", "nchan", "w", "h", "pitch")]
+  lane, j = UOp.range(n, 0), UOp.range(nchan, 1)
+  x, y = r.index(src1 * n + lane).load(), r.index((src1 + 1) * n + lane).load()
+  ok = (x < w.cast(dtypes.uint32)) & (y < h.cast(dtypes.uint32))
+  texel = img.index(ok.where(y.cast(dtypes.int32) * pitch + x.cast(dtypes.int32) * 4 + chans.index(j).load(), 0)).load()
+  out, bits = (r, dtypes.uint32) if dt == np.float32 else (UOp.param(4, dtypes.uint16, NREGS * MAX_BLOCK_LANES, name="h"), dtypes.uint16)
+  value = ok.where(texel, 0).cast(TEX_DTYPES[dt]).bitcast(bits)
+  return cpu_kernel(out.index(((dst + j) * n + lane).valid(mask.index(lane).load().ne(0))).store(value).end(j).end(lane), "qcom_isam")
 
 EXEC:dict[type, Callable] = {Cat1: exec_mov, Cat2: exec_alu, Cat3: exec_alu, Cat4: exec_alu, Cat5: exec_isam, Ibo: exec_ibo, Ldg: exec_mem,
                              Stg: exec_mem, Load: exec_mem, Store: exec_mem}
@@ -412,6 +514,7 @@ def run(d:Dispatch):
   tid = np.arange(n_local * n_groups)
   lid, gid = tid % n_local, tid // n_local
   prog = decode(d.image)
+  blocks = alu_blocks(d.image, d.entry)
   t = Threads(d, len(tid))
   ops = {i.op for i in prog if isinstance(i, (Load, Store))}
   if ops & {mesa.OPC_LDL, mesa.OPC_STL}:
@@ -431,6 +534,11 @@ def run(d:Dispatch):
         cur = int(pc[live].min()) # lowest pc first, so paths reconverge and nobody passes a bar early
         t.mask = (pc == cur) & ~done
       if isinstance(i := prog[cur], NotImplementedError): raise i
+      if (b := blocks.get(cur)) is not None:
+        exec_block(t, b)
+        if together is not None: together = b.end
+        else: pc[t.mask] = b.end
+        continue
       if (fn := EXEC.get(type(i))) is not None:
         for k in range(i.iterations): fn(t, i, k)
         if together is not None: together = cur + 1

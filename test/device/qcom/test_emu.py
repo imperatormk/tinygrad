@@ -100,6 +100,33 @@ class TestQCOMEmu(unittest.TestCase):
     with patch.object(emu.Threads, "__init__", poisoned), Context(IMAGE=1): np.testing.assert_equal(Tensor(a).triu(1).numpy(), np.triu(a, 1))
 
   @unittest.skipUnless(DEV.interface.startswith("MOCK"), "MOCK only")
+  def test_alu_blocks(self): # compiled blocks match exec_alu bit for bit, with masked lanes and denormal/nan/-0 sources
+    from test.mockgpu.qcom import emu
+    run, dispatches = emu.run, []
+    def capture(d):
+      dispatches.append(d)
+      run(d)
+    w = np.random.default_rng(0).standard_normal((1, 1, 13, 13)).astype(np.float32)
+    with patch.object(emu, "run", capture), Context(IMAGE=1): (Tensor(w).conv2d(Tensor(w[..., :3, :3]), padding=1) + Tensor(w)).realize()
+    special = np.array([1e-45, -1e-38, -0.0, np.nan, np.inf, -np.inf, 1.5, 3e38, -2.0, 1e-20, 7.0, 0.1, -3.0], np.float32).view(np.uint32)
+    checked = 0
+    for d in dispatches:
+      prog = emu.decode(d.image)
+      targets = {i.target for i in prog if isinstance(i, emu.Cat0)}
+      for start, b in emu.alu_blocks(d.image, d.entry).items():
+        self.assertFalse(targets & set(range(start + 1, b.end)))
+        fast, slow = emu.Threads(d, 13), emu.Threads(d, 13)
+        fast.r[:] = slow.r[:] = np.random.default_rng(start).choice(special, fast.r.shape)
+        fast.mask = slow.mask = np.arange(13) % 3 != 0
+        emu.exec_block(fast, b)
+        with np.errstate(all="ignore"):
+          for i in prog[start:b.end]:
+            for k in range(i.iterations): emu.exec_alu(slow, i, k)
+        np.testing.assert_equal(fast.r, slow.r)
+        checked += 1
+    self.assertGreater(checked, 0)
+
+  @unittest.skipUnless(DEV.interface.startswith("MOCK"), "MOCK only")
   def test_unsupported(self):
     from tinygrad.engine.realize import lower_and_compile, run_linear
     from test.mockgpu.qcom.qcomdriver import EmulatorError
