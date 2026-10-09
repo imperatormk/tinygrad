@@ -508,12 +508,17 @@ def alu_kernel(ops:tuple[int, ...]) -> Callable[..., None]: # only the ops a blo
   outs = [uop_result(uop_ftz((fa * fb).bitcast(dtypes.uint32)).bitcast(dtypes.float32) + fc), a * b + c, a << amt, a >> amt,
           (a.bitcast(dtypes.int32) >> amt.bitcast(dtypes.int32)).bitcast(dtypes.uint32), a & b, a | b, a ^ b, b.ne(0).where(a, c)]
   out = functools.reduce(lambda acc, o: op.eq(o).where(outs[o], acc), ops[1:], outs[ops[0]])
-  dst, keep = r.index(rec[0].cast(dtypes.int32) * n + lane), mask.index(lane).load().cast(dtypes.uint32) * 0xffffffff
-  store = dst.store((out & keep) | (dst.load() & (keep ^ 0xffffffff))) # a blend instead of a masked store, which is microcoded on x86
-  return cpu_kernel(store.end(lane).end(k), "qcom_alu_" + "_".join(map(str, ops)))
+  # through a scratch row: a destination that is also a source (r = a * b + r) would fail clang's overlap check and run scalar
+  tmp, lane2 = UOp.param(3, dtypes.uint32, MAX_BLOCK_LANES, name="tmp"), UOp.range(n, 2)
+  computed = tmp.index(lane).store(out).end(lane)
+  dst, keep = r.index(rec[0].cast(dtypes.int32) * n + lane2), mask.index(lane2).load().cast(dtypes.uint32) * 0xffffffff
+  value = tmp.after(computed).index(lane2).load()
+  store = dst.store((value & keep) | (dst.load() & (keep ^ 0xffffffff))) # a blend instead of a masked store, which is microcoded on x86
+  return cpu_kernel(store.end(lane2).end(k), "qcom_alu_" + "_".join(map(str, ops)))
 
 def exec_block(t:Threads, b:AluBlock):
-  alu_kernel(b.ops)(t.r.ctypes.data, t.mask.ctypes.data, b.records.ctypes.data, n=t.r.shape[1], count=len(b.records))
+  tmp = np.empty(t.r.shape[1], np.uint32)
+  alu_kernel(b.ops)(t.r.ctypes.data, t.mask.ctypes.data, b.records.ctypes.data, tmp.ctypes.data, n=len(tmp), count=len(b.records))
 
 TEX_DTYPES = {np.dtype(np.float16): dtypes.half, np.dtype(np.float32): dtypes.float32}
 
