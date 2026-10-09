@@ -236,9 +236,33 @@ class TestBFloat16DTypeCast(unittest.TestCase):
     converted = random_values.cast(dtypes.bfloat16).cast(dtypes.float32)
     np.testing.assert_allclose(converted.numpy(), random_values.cast(dtypes.float32).numpy(), rtol=1e-2, atol=1e-3)
 
-class TestHalfDType(TestDType): DTYPE = dtypes.half
+class TestHalfDType(TestDType):
+  DTYPE = dtypes.half
+
+  def test_cast_round_to_even(self):
+    data = np.array([1.00048828125, 1.00146484375, 1.0006, -1.00048828125, -1.00146484375, -1.0006], dtype=np.float32)
+    np.testing.assert_array_equal(Tensor(data).half().numpy(), data.astype(np.float16))
+  @unittest.skipIf(Device.DEFAULT in ("CL", "WEBGPU"), "mesa (rusticl, lavapipe) folds float(half(x)) to x, mesa#15948")
+  def test_fused_normal_cast_roundtrip(self):
+    data = np.array([1.0001, 1.0006, -1.0006, 0.3333, 2049.0, 0.0, -0.0], dtype=np.float32)
+    actual = Tensor(data).realize().half().float().numpy()
+    np.testing.assert_array_equal(actual.view(np.uint32), data.astype(np.float16).astype(np.float32).view(np.uint32))
+
 
 class TestEmulatedHalf(TestHalfDType):
+  def test_cast_overflow_rounding(self):
+    data = np.array([65504, 65505, 65519, 65520, 65521, -65505, -65519, -65520], dtype=np.float32)
+    with np.errstate(over="ignore"): expected = data.astype(np.float16)
+    np.testing.assert_array_equal(Tensor(data).half().numpy(), expected)
+
+  def test_fused_cast_roundtrip(self):
+    data = np.array([1.0001, 1.0006, 1.00048828125, 1.00146484375, -1.0006, 0.3333, 2049.0, 0.0, -0.0], dtype=np.float32)
+    x = Tensor(data).realize()
+    fused = x.half().float().numpy()
+    stored = x.half().realize().float().numpy()
+    np.testing.assert_array_equal(fused.view(np.uint32), data.astype(np.float16).astype(np.float32).view(np.uint32))
+    np.testing.assert_array_equal(fused.view(np.uint32), stored.view(np.uint32))
+
   @classmethod
   def setUpClass(cls):
     cls.stack = contextlib.ExitStack()
@@ -251,6 +275,23 @@ class TestEmulatedHalf(TestHalfDType):
 
 class TestFloatDType(TestDType):
   DTYPE = dtypes.float
+
+  def test_float_dot_grouping(self):
+    a = [0.289794921875, 0.56201171875, 0.74462890625, -0.0248565673828125]
+    b = [-1.486328125, -0.97119140625, 0.147705078125, -0.42529296875]
+    acc = Tensor([0.5835781693458557], dtype=dtypes.float).realize()
+    products = [Tensor([x], dtype=dtypes.float).realize()*Tensor([y], dtype=dtypes.float).realize() for x,y in zip(a,b)]
+    out = acc + (((products[0]+products[1])+products[2])+products[3])
+    np.testing.assert_array_equal(out.numpy(), [-0.272416353225708])
+
+  def test_float_grouping(self):
+    for mul, values in ((False, [1.0, 1e8, -1e8]), (True, [1e30, 1e-30, 1e-30])):
+      with self.subTest(mul=mul):
+        a, b, c = [Tensor([v], dtype=dtypes.float).realize() for v in values]
+        fused = (a*(b*c) if mul else a+(b+c)).numpy()
+        stored = (a*(b*c).realize() if mul else a+(b+c).realize()).numpy()
+        np.testing.assert_array_equal(fused, stored)
+        np.testing.assert_array_equal(fused, [0.0 if mul else 1.0])
 
   def test_float_to_uint(self):
     _test_op(lambda: Tensor([-0.9, -0.3, 1.2], dtype=dtypes.float32).cast(dtypes.uint32), dtypes.uint32,

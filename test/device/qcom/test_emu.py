@@ -4,6 +4,7 @@ import numpy as np
 from tinygrad import Tensor, Device, dtypes
 from tinygrad.helpers import DEV, Context
 from tinygrad.runtime.autogen import mesa
+from tinygrad.renderer.cstyle import QCOMCLRenderer
 from tinygrad.uop.ops import UOp, Ops, AxisType, KernelInfo
 
 @unittest.skipUnless(Device.DEFAULT == "QCOM", "QCOM only")
@@ -18,6 +19,33 @@ class TestQCOMEmu(unittest.TestCase):
 
   def test_int64_to_float(self):
     np.testing.assert_equal(Tensor([1, -2, 0, 2**40], dtype=dtypes.int64).cast(dtypes.float32).numpy(), np.array([1, -2, 0, 2**40], np.float32))
+    if isinstance(Device.default.renderer, QCOMCLRenderer):
+      rng = np.random.default_rng(0)
+      for dt in (np.int64, np.uint64):
+        limit = np.iinfo(dt)
+        values = [limit.min, limit.max, 0, 1]
+        for e in range(24, 64):
+          # Either side of an FP32 halfway point, plus both even and odd significands.
+          for n in (2**e, 2**e + 2**(e-24), 2**e + 3*2**(e-24)):
+            for delta in (-1, 0, 1):
+              values += [v for v in (n+delta, -n-delta) if limit.min <= v <= limit.max]
+        a = np.concatenate((np.array(values, dt), rng.integers(limit.min, limit.max, 1024, dtype=dt)))
+        np.testing.assert_equal(Tensor(a).cast(dtypes.float32).numpy(), a.astype(np.float32))
+
+  def test_add64(self):
+    # A scalar int64 + 1 used to trigger an IndexedMap assertion in the CL compiler.
+    bits = np.array([0, 1, 0xffffffff, 0x100000000, 0xffffffffffffffff, 0x7fffffffffffffff, 0x8000000000000000, 0x12345678ffffffff], np.uint64)
+    for dt in (np.int64, np.uint64):
+      a, b = bits.view(dt), bits[::-1].copy().view(dt)
+      for n in (1, len(a)):
+        for off in range(0, len(a), n):
+          av, bv = a[off:off+n], b[off:off+n]
+          np.testing.assert_equal((Tensor(av) + 1).numpy(), av + 1)
+          np.testing.assert_equal((Tensor(av) + Tensor(bv)).numpy(), av + bv)
+      rng = np.random.default_rng(1)
+      av, bv, cv = [rng.integers(0, 2**64, 256, dtype=np.uint64).view(dt) for _ in range(3)]
+      with Context(NOOPT=1): # exercise scalar lowering across many lanes, including nested expressions
+        np.testing.assert_equal((Tensor(av) + Tensor(bv) + Tensor(cv)).numpy(), av + bv + cv)
 
   def test_half_const(self):
     np.testing.assert_equal((Tensor([1.5, 2.5, 1.0], dtype=dtypes.half) - 1.0).numpy(), np.array([0.5, 1.5, 0.0], np.float16))
@@ -34,7 +62,8 @@ class TestQCOMEmu(unittest.TestCase):
   def test_bool_store(self):
     np.testing.assert_equal((Tensor([1.0, 5, 6]) < Tensor([2.0, 3, 6])).numpy(), np.array([True, False, False]))
 
-  def test_mad(self): # not fused, denormal products flush
+  @Context(IMAGE=1, FLOAT16=1)
+  def test_mad(self): # test native half arithmetic, not CL's promoted float32 fallback
     for dt, eps in ((np.float32, 2**-12), (np.float16, 2**-6)):
       a, c = np.array([1 + eps, 1 + 2 * eps, 1 + 3 * eps, 1.5], dt), np.array([-1, -1, -1, -2.25], dt)
       np.testing.assert_equal((Tensor(a) * Tensor(a) + Tensor(c)).numpy(), a * a + c)
@@ -42,17 +71,21 @@ class TestQCOMEmu(unittest.TestCase):
       out = (Tensor(np.array([a, a], dt)) * Tensor(np.array([a, a], dt)) + Tensor(np.array([c, -c], dt))).numpy()
       self.assertEqual(out.view(f"u{out.itemsize}").tolist(), bits)
 
+  @Context(IMAGE=1, FLOAT16=1)
   def test_dst_conv(self):
     a = Tensor(np.array([1 + 2**-11 + 2**-13, 1e5, 2**-15 + 2**-17], np.float32))
     out = (a * Tensor(np.ones(3, np.float32))).half().numpy()
-    self.assertEqual(out.view(np.uint16).tolist(), [0x3c00, 0x7bff, 0x0])
+    self.assertEqual(out.view(np.uint16).tolist(), [0x3c01, 0x7c00, 0x0])
 
+  @Context(IMAGE=1, FLOAT16=1)
   def test_cov(self):
+    # Both compilers request round-to-nearest-even; native half conversion still flushes subnormals.
     np.testing.assert_equal(Tensor([2**24 + 3, -(2**24 + 3), 2**31 - 1], dtype=dtypes.int32).cast(dtypes.float32).numpy(),
-                            np.array([2**24 + 2, -(2**24 + 2), 2**31 - 2**7], np.float32))
+                            np.array([2**24 + 4, -(2**24 + 4), 2**31], np.float32))
     np.testing.assert_equal(Tensor([1 + 2**-11 + 2**-13, 1e5, -1e30, 2**-20], dtype=dtypes.float32).cast(dtypes.half).numpy(),
-                            np.array([1, 65504, -65504, 0], np.float16))
+                            np.array([1 + 2**-10, np.inf, -np.inf, 0], np.float16))
 
+  @Context(IMAGE=1, FLOAT16=1)
   def test_denormals(self):
     np.testing.assert_equal((Tensor(np.array([1e-45, -1e-39, 1.0], np.float32)) * 1.5).numpy(), np.array([0, -0.0, 1.5], np.float32))
     np.testing.assert_equal(Tensor(np.array([1e-40], np.float32)).log2().numpy(), np.array([-np.inf], np.float32))
@@ -68,6 +101,7 @@ class TestQCOMEmu(unittest.TestCase):
     self.assertEqual(a.maximum(b).numpy().view(np.uint32).tolist(), [0x3f800000, 0x3f800000, 0, 0])
     self.assertEqual(a.minimum(b).numpy().view(np.uint32).tolist(), [0x3f800000, 0x3f800000, 0x80000000, 0x80000000])
 
+  @Context(IMAGE=1, FLOAT16=1)
   def test_half_rcp(self):
     out = Tensor(np.array([894.0, 17.52, 2418.0], np.float16)).reciprocal().numpy()
     np.testing.assert_equal(out.view(np.uint16), np.array([0x1494, 0x2b4e, 0x0ec6], np.uint16))

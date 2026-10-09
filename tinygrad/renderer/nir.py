@@ -25,7 +25,11 @@ aop = {**{x:u_aop for x in (dtypes.bool,)+dtypes.uints}, **{x:s_aop for x in dty
 
 def c(t:DType, u:bool=True) -> str: return "u" if t in dtypes.uints and u else ("i" if t in dtypes.ints else ("f" if t in dtypes.floats else "b"))
 def ncast(b:mesa.nir_builder, src:mesa.nir_def, it:DType, ot:DType) -> mesa.nir_def:
-  return nalu(b, f"{c(it)}2{c(it) if it in dtypes.ints and ot in dtypes.ints else c(ot, ot == dtypes.bool)}{ot.bitsize}", src)
+  exact = b.exact
+  # Explicit narrowing must round even when its result is immediately widened.
+  b.exact = exact or (dtypes.is_float(it) and dtypes.is_float(ot) and it.itemsize > ot.itemsize)
+  try: return nalu(b, f"{c(it)}2{c(it) if it in dtypes.ints and ot in dtypes.ints else c(ot, ot == dtypes.bool)}{ot.bitsize}", src)
+  finally: b.exact = exact
 
 def nif(b:mesa.nir_builder, cond:mesa.nir_def, then_fn:Callable, else_fn:Callable):
   nif = mesa.nir_push_if(b, cond)
@@ -35,7 +39,12 @@ def nif(b:mesa.nir_builder, cond:mesa.nir_def, then_fn:Callable, else_fn:Callabl
   mesa.nir_pop_if(b, nif)
   return t, e
 
-def nalu(b:mesa.nir_builder, op:str, *srcs:mesa.nir_def) -> mesa.nir_def: return g(f"nir_build_alu{len(srcs)}")(b, g(f"nir_op_{op}"), *srcs).contents
+def nalu(b:mesa.nir_builder, op:str, *srcs:mesa.nir_def) -> mesa.nir_def:
+  exact = b.exact
+  # Preserve explicit floating add/multiply grouping through NIR optimization.
+  b.exact = exact or op in {"fadd", "fmul", "ffma"}
+  try: return g(f"nir_build_alu{len(srcs)}")(b, g(f"nir_op_{op}"), *srcs).contents
+  finally: b.exact = exact
 
 def nir_instr(nc=1, bs=lambda: None, intrins=None, srcs=None, has_def=True, df=None, also=lambda: None, **contents):
   def dec(f:Callable):
@@ -293,6 +302,9 @@ class IR3Renderer(NIRRenderer):
     (UPat(Ops.LOAD, src=(UPat.var('img').index(UPat.var('idx_y'), UPat.var('idx_x')), UPat.var("alt"), UPat.var("gate"))),
      lambda ctx,img,idx_y,idx_x,alt,gate: if_phi(ctx.b, ctx.r[gate], lambda: ctx.nload_img(img, idx_y, idx_x), lambda: ctx.r[alt])),
     (UPat(Ops.LOAD, src=(UPat.var('img').index(UPat.var('idx_y'), UPat.var('idx_x')),)), nload_img),
+    # ir3's mad is unfused, so this keeps the exact fadd/fmul results
+    (UPat(Ops.ADD, dtypes.floats, src=[UPat(Ops.MUL, name="m"), UPat.var("c")]),
+     lambda ctx,m,c: nalu(ctx.b, "ffma", ctx.r[m.src[0]], ctx.r[m.src[1]], ctx.r[c])),
   ]) + NIRRenderer.def_rewrite
 
   _param = LVPRenderer.param
@@ -317,5 +329,6 @@ class IR3Renderer(NIRRenderer):
 
     self.b.shader.contents.info.num_ubos = len([u for u in bufs if not is_image_shape(u._shape)])
     self.b.shader.contents.info.num_images = texs() + imgs()
+    self.b.shader.contents.info.float_controls_execution_mode = (1 << 15) | (1 << 16) # FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP16 | _FP32
 
   def supported_dtypes(self): return {d for d in NIRRenderer.supported_dtypes(self) if d != dtypes.double}

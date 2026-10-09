@@ -62,7 +62,8 @@ base_rewrite = PatternMatcher([
   # alu/gep
   (UPat(Ops.WMMA, name="x"), lambda ctx,x: f"__{_wmma_name(x)}({ctx[x.src[0]]}, {ctx[x.src[1]]}, {ctx[x.src[2]]})"),
   (UPat(GroupOp.ALU, name="x"), lambda ctx,x: ctx.code_for_op[x.op](
-    *([strip_parens(ctx[v]) if v.op == x.op and x.op in {Ops.ADD, Ops.MUL, Ops.XOR, Ops.OR, Ops.AND} else ctx[v] for v in x.src]), x.dtype)),
+    *([strip_parens(ctx[v]) if v.op == x.op and (i == 0 or not dtypes.is_float(x.dtype)) and x.op in {Ops.ADD, Ops.MUL, Ops.XOR, Ops.OR, Ops.AND}
+       else ctx[v] for i,v in enumerate(x.src)]), x.dtype)),
 
   # call an external function by symbol: the CUSTOM_FUNCTION body names the callee, the srcs are the args and set the types
   (UPat(Ops.CALL, src=(UPat(Ops.CUSTOM_FUNCTION, name="f"),), allow_any_len=True, name="x"), lambda ctx,x,f:
@@ -610,10 +611,30 @@ class HIPCCRenderer(HIPRenderer):
   def __init__(self, target:Target): super().__init__(target, use_hipcc=True)
 
 class QCOMCLRenderer(OpenCLRenderer):
+  string_rewrite = PatternMatcher([
+    (UPat(Ops.ADD, (dtypes.int64, dtypes.uint64), name="x"), lambda ctx,x: ctx.render_add64(x) if x.max_numel() == 1 else None),
+  ]) + OpenCLRenderer.string_rewrite
+
   def __init__(self, target:Target):
     super().__init__(target)
-    from tinygrad.runtime.support.compiler_qcom import QCOMCompiler
-    self.compiler = QCOMCompiler(target.arch)
+    from tinygrad.runtime.support.compiler_qcom import qcom_compiler
+    self.compiler = qcom_compiler(target.arch)
+
+  def render_add64(self, u:UOp) -> str:
+    return f"as_{self.render_type(u)}(tg_add64(as_ulong({self[u.src[0]]}), as_ulong({self[u.src[1]]})))"
+
+  def render_kernel(self, function_name, kernel, bufs, uops, prefix=None) -> str:
+    # QCOM's scalar 64-bit add lowering can crash. A helper keeps nested adds from duplicating operand expressions.
+    if any(u.op is Ops.ADD and u.dtype in (dtypes.int64, dtypes.uint64) and u.max_numel() == 1 for u in uops):
+      prefix = (prefix or []) + ["static inline ulong tg_add64(ulong a, ulong b) {",
+        "  uint2 x = as_uint2(a), y = as_uint2(b);", "  uint lo = x.x + y.x;",
+        "  return as_ulong((uint2)(lo, x.y + y.y + (lo < x.x)));", "}"]
+    return super().render_kernel(function_name, kernel, bufs, uops, prefix)
+
+  def render_cast(self, u:UOp, val:str) -> str:
+    if u.dtype == dtypes.float and u.src[0].dtype in (dtypes.int64, dtypes.uint64): return f"convert_{self.render_type(u)}_rte({val})"
+    if u.dtype == dtypes.half and u.src[0].dtype == dtypes.float: return f"convert_{self.render_type(u)}_rte({val})"
+    return super().render_cast(u, val)
 
   # QCOM compiler is flaky with half
   def supported_dtypes(self):
