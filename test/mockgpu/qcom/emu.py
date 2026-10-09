@@ -433,8 +433,11 @@ def fast_alu(i:Inst|NotImplementedError) -> bool:
 @dataclass(frozen=True)
 class AluBlock:
   end:int
-  dsts:tuple[int, ...]
-  records:np.ndarray # int32 (op, dst, src0, src1, src2, absneg0, absneg1, absneg2) per instruction
+  records:np.ndarray # uint32 (dst, row0, row1, row2, and0, and1, and2, xor0, xor1, xor2) per instruction, computing src0 * src1 + src2
+
+ONE, NEG_ZERO = Src("i", 0x3f800000), Src("i", 0x80000000) # x * 1 and x + -0 are exact, so add and mul become mads
+def alu_source(s:Src) -> tuple[int, int, int]:
+  return (0, 0, s.val) if s.kind == "i" else (s.val, 0x7fffffff if s.absneg & 2 else 0xffffffff, 0x80000000 if s.absneg & 1 else 0)
 
 @functools.cache
 def alu_blocks(image:bytes, entry:int) -> dict[int, AluBlock]:
@@ -446,12 +449,12 @@ def alu_blocks(image:bytes, entry:int) -> dict[int, AluBlock]:
       continue
     start, recs = pc, []
     while pc < len(prog) and isinstance(i := prog[pc], (Cat2, Cat3)) and fast_alu(i) and (pc == start or pc not in starts):
-      for k in range(i.iterations):
-        srcs = (i.repeat_srcs[k] * 3)[:3] # pad to 3 sources
-        recs.append([FAST_ALU.index(i.op), i.dst + k, *[s.val for s in srcs], *[s.absneg for s in srcs]])
+      for k, s in enumerate(i.repeat_srcs):
+        rows, ands, xors = zip(*map(alu_source, {mesa.OPC_ADD_F: (s[0], ONE, s[1]), mesa.OPC_MUL_F: (s[0], s[1], NEG_ZERO)}.get(i.op, s)))
+        recs.append([i.dst + k, *rows, *ands, *xors])
       pc += 1
     assert len(recs) < 1 << 16, f"pc {start}: alu block too long"
-    blocks[start] = AluBlock(pc, tuple(sorted({rec[1] for rec in recs})), np.array(recs, np.int32))
+    blocks[start] = AluBlock(pc, np.array(recs, np.uint32))
   return blocks
 
 def uop_ftz(u:UOp) -> UOp: return ((u & 0x7fffffff) < 0x00800000).where(u & 0x80000000, u)
@@ -472,17 +475,12 @@ def cpu_kernel(ended:UOp, name:str) -> Callable[..., None]:
 @functools.cache
 def alu_kernel() -> Callable[..., None]:
   (r, mask, n), count = lane_params(), UOp.variable("count", 1, 1 << 16)
-  recs, k, lane = UOp.param(2, dtypes.int32, 8 << 16, name="recs"), UOp.range(count, 0), UOp.range(n, 1)
-  rec = [recs.index(k * 8 + j).load() for j in range(8)]
-  def read(j:int) -> UOp:
-    u = r.index(rec[2 + j] * n + lane).load()
-    u = (rec[5 + j] & 2).ne(0).where(u & 0x7fffffff, u)
-    u = (rec[5 + j] & 1).ne(0).where(u ^ 0x80000000, u)
-    return uop_ftz(u).bitcast(dtypes.float32)
-  a, b, c = read(0), read(1), read(2)
-  mad = uop_result(uop_ftz((a * b).bitcast(dtypes.uint32)).bitcast(dtypes.float32) + c)
-  out = rec[0].eq(0).where(uop_result(a + b), rec[0].eq(1).where(uop_result(a * b), mad))
-  store = r.index((rec[1] * n + lane).valid(mask.index(lane).load().ne(0))).store(out)
+  recs, k, lane = UOp.param(2, dtypes.uint32, 10 << 16, name="recs"), UOp.range(count, 0), UOp.range(n, 1)
+  rec = [recs.index(k * 10 + j).load() for j in range(10)]
+  def read(j:int) -> UOp: return uop_ftz((r.index(rec[1 + j].cast(dtypes.int32) * n + lane).load() & rec[4 + j]) ^ rec[7 + j]).bitcast(dtypes.float32)
+  out = uop_result(uop_ftz((read(0) * read(1)).bitcast(dtypes.uint32)).bitcast(dtypes.float32) + read(2))
+  dst, keep = r.index(rec[0].cast(dtypes.int32) * n + lane), mask.index(lane).load().cast(dtypes.uint32) * 0xffffffff
+  store = dst.store((out & keep) | (dst.load() & (keep ^ 0xffffffff))) # a blend instead of a masked store, which is microcoded on x86
   return cpu_kernel(store.end(lane).end(k), "qcom_alu")
 
 def exec_block(t:Threads, b:AluBlock):
