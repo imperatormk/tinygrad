@@ -652,9 +652,11 @@ jobs:
           unset PARALLEL
           for model in dmonitoring_model driving_supercombo; do
             onnx="https://huggingface.co/commaai/openpilot-lfs/resolve/$LFS_SHA/openpilot/selfdrive/modeld/models/$model.onnx"
-            IMAGE=1 FLOAT16=1 python examples/openpilot/compile_onnx.py "$onnx" /tmp/openpilot.pkl --benchmark-runs 1
-            IMAGE=1 FLOAT16=1 MODEL_ONNX="$onnx" MODEL_PKL=/tmp/openpilot.pkl python -m pytest -q test/external/external_test_compile.py -k test_onnx
+            (IMAGE=1 FLOAT16=1 python examples/openpilot/compile_onnx.py "$onnx" /tmp/$model.pkl --benchmark-runs 1 &&
+             IMAGE=1 FLOAT16=1 MODEL_ONNX="$onnx" MODEL_PKL=/tmp/$model.pkl python -m pytest -q test/external/external_test_compile.py -k test_onnx) > /tmp/$model.log 2>&1 &
           done
+          status=0; for job in $(jobs -p); do wait $job || status=1; done
+          cat /tmp/dmonitoring_model.log /tmp/driving_supercombo.log; exit $status
       - name: Run process replay tests
         uses: ./.github/actions/process-replay
 
