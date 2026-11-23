@@ -2,7 +2,7 @@ import ctypes, time, os, builtins, fcntl, typing
 from tinygrad.helpers import DEV, dedup, to_tuple, round_up
 from tinygrad.device import Compiled, Device
 from tinygrad.dtype import dtypes
-from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, CustomFunction
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, NativeInfo
 from tinygrad.runtime.support.system import FileIOInterface, System
 from tinygrad.runtime.support.hcq2 import HWQueue
 from tinygrad.runtime.autogen import libc
@@ -32,9 +32,8 @@ def hook_doorbells(s:UOp) -> UOp|None:
   hooks = tuple(UOp.native("mockgpu_doorbell").call(b.after(c).getaddr(Device[d].host)) for c in s.toposort() if c.op is Ops.CALL
                 for b in c.src[1:] if b.op is Ops.EXTERN and "doorbell" in str(b.arg.name) and (d:=to_tuple(b.device)[0]).split(":")[0] in mocked)
   return None if all(h in s.src for h in hooks) else s.replace(src=tuple(dedup(s.src + hooks)))
-def hook_ioctl(f:UOp) -> UOp|None:
-  return f.replace(arg=CustomFunction("mockgpu_ioctl", f.arg.dtype)) if f.arg.name == "ioctl" and "QCOM" in mocked else None
-Compiled.pm_lower += PatternMatcher([(UPat(Ops.SINK, name="s"), hook_doorbells), (UPat(Ops.CUSTOM_FUNCTION, name="f"), hook_ioctl)])
+def hook_ioctl(f:UOp) -> UOp|None: return f.replace(arg=NativeInfo("mockgpu_ioctl")) if "QCOM" in mocked else None
+Compiled.pm_lower += PatternMatcher([(UPat(Ops.SINK, name="s"), hook_doorbells), (UPat.native("ioctl", name="f"), hook_ioctl)])
 
 @ctypes.CFUNCTYPE(None, ctypes.c_uint64)
 def mockgpu_progress(_:int): # compiled spin loops wait on the gpus, which run only when called
