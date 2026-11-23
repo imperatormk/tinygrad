@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Callable, Generator, cast
-import functools, subprocess, pathlib, struct
+import subprocess, pathlib, struct
 from dataclasses import dataclass, replace
 from tinygrad.helpers import prod, Target, EMULATED_DTYPES, CCACHE, getenv, diskcache_get, diskcache_put, unwrap, round_up
 from tinygrad.uop.ops import Ops, UOp, sint, ssimplify, smin, GroupOp, PatternMatcher
@@ -101,9 +101,6 @@ class Estimates:
         flops += 2 * prod(u.arg[0]) // u.arg[2] * mults
     return Estimates(ssimplify(flops), lds, sum(mem.values()))
 
-@functools.cache
-def _cached_renderer(cls:type[Renderer], target:Target) -> Renderer: return cls(target)
-
 class Renderer:
   target: Target
   suffix: str = ""
@@ -125,7 +122,9 @@ class Renderer:
   compiler: Compiler = Compiler()
 
   def __init__(self, target:Target): self.target = target
-  def __reduce__(self): return _cached_renderer, (self.__class__, self.target)
+  def __reduce__(self):
+    from tinygrad.device import select_renderer
+    return select_renderer, (self.target,)
   def render(self, uops:list[UOp]) -> str: raise NotImplementedError("needs a renderer")
   def asm(self, prg:UOp, lin:UOp) -> bytes: raise NotImplementedError("needs an assembler")
   def supported_dtypes(self) -> set[DType]:
