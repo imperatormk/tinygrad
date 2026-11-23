@@ -199,7 +199,7 @@ class TestViz(unittest.TestCase):
 
   @Context(SPEC=1)
   def test_dtype_label(self):
-    u = UOp(Ops.ADD, src=(UOp.custom_function("fn"), UOp.const(1)))
+    u = UOp(Ops.ADD, src=(UOp.native("fn"), UOp.const(1)))
     node = uop_to_json(VizData(), u)[id(u)]
     self.assertTrue(node["label"].startswith("ADD"))
     self.assertIn("ISSUE GETTING DTYPE", node["label"])
@@ -213,7 +213,7 @@ class TestViz(unittest.TestCase):
       a = UOp(Ops.PYLITERAL, src=tuple(src), arg=arg)
       exec_rewrite(a, [PatternMatcher([])])
     a2 = next(viz.get_details(0, 0))["graph"][id(a)]
-    self.assertEqual(ansistrip(a2["label"]), "PYLITERAL\nx\nyzww\nw")
+    assert ansistrip(a2["label"]).startswith("PYLITERAL\nx\nyzww\nw")
 
   def test_inf_loop(self):
     a = UOp.const(3)
@@ -255,17 +255,20 @@ class TestViz(unittest.TestCase):
       z = UOp.const(0)
       y = UOp.const(math.pi)
       alu = a*z
-      ret = exec_rewrite(sink:=UOp.sink(alu, y), [sym])
+      cc = UOp.cconst(1, dtypes.int)
+      alu2 = cc + a
+      ret = exec_rewrite(sink:=UOp.sink(alu, alu2, y), [sym])
     lst = viz.list_items()
     self.assertEqual(len(lst), 1)
     graphs = [x["graph"] for x in viz.get_details(0, 0)]
     # const is always in the graph, client side hides exclude=True nodes by default
-    self.assertEqual(list(graphs[0]), [id(a.src[0]), id(a), id(z), id(alu), id(y), id(sink)])
+    self.assertEqual(list(graphs[0]), [id(a.src[0]), id(a), id(z), id(alu), id(cc.src[0]), id(cc), id(alu2), id(y), id(sink)])
     self.assertTrue(graphs[0][id(z)]["exclude"])
     self.assertTrue(graphs[0][id(y)]["exclude"])
     self.assertFalse(graphs[0][id(alu)]["exclude"])
     self.assertEqual(graphs[0][id(y)]["label"].split("\n")[:2], ["CONST", "3.14159"])
-    self.assertEqual(list(graphs[1]), [id(u) for u in ret.toposort()])  # rewrite graph keys follow the rewritten sink's toposort
+    self.assertEqual(graphs[0][id(alu2)]["label"].split("\n")[2:], ["CONST0 1 dtypes.i32", "PARAM1 a Ops.STACK", "()"])
+    self.assertEqual(list(graphs[2]), [id(u) for u in ret.toposort()])  # rewrite graph keys follow the rewritten sink's toposort
 
   def test_const_reshape_expand_folded(self):
     # CONST->EXPAND should be folded into the ALU node, not shown as separate EXPAND nodes
@@ -398,6 +401,20 @@ class TestVizIntegration(unittest.TestCase):
     with Context(BEAM=2):
       self.test_link_sched_codegen()
 
+  @Context(DEV="NULL:X86:x86_64")
+  def test_insts_label(self):
+    name = "insts_label"
+    def custom_insts(A): return A[0].set(A[0]+1).sink(arg=KernelInfo(name))
+    x = Tensor.custom_kernel(Tensor.empty(1), fxn=custom_insts)[0]
+    with save_viz() as viz:
+      x.realize()
+    lst = viz.list_items()
+    kern_idx = next(i for i,s in enumerate(lst) if s["name"] == name)
+    isel_idx = next(i for i,s in enumerate(lst[kern_idx]["steps"]) if s["name"] == "instruction selection")
+    graph = next(viz.get_details(kern_idx, isel_idx+1))["graph"]
+    for u in graph.values():
+      if u["label"].startswith("CALL\n"): assert "NATIVE X86Ops" in u["label"]
+
   # tracing also works without a rewrite_group context
   # all graph_rewrites get put into the default group
   def test_default_tracing(self):
@@ -472,7 +489,7 @@ class TestVizIntegration(unittest.TestCase):
     def custom_fn(X:UOp):
       X = X.flatten()
       i = UOp.range(X.numel(), 0)
-      custom_op = UOp.custom_function("{0} + undeclared_name;", shape=X[i].shape, dtype=X.dtype, fmt=True).call(X[i], inline=True)
+      custom_op = UOp.native("{0} + undeclared_name;", shape=X[i].shape, dtype=X.dtype, fmt=True).call(X[i], inline=True)
       self.assertEqual(custom_op.shape, ())
       return X[i].store(custom_op).end(i).sink(arg=KernelInfo(name=f"custom_fn_{X.numel()}"))
     x = Tensor.custom_kernel(Tensor.empty(1, device="CPU"), fxn=custom_fn)[0]
@@ -489,7 +506,7 @@ class TestVizIntegration(unittest.TestCase):
     # Ops.LINEAR renders
     lin_render = ansistrip(get_render(viz.data, steps[lin_idx]["query"])["src"])
     self.assertIn("sink", lin_render)
-    self.assertIn("custom_function", lin_render)
+    self.assertIn("native", lin_render)
     # Ops.SOURCE renders
     src_render = get_render(viz.data, steps[src_idx]["query"])["src"]
     self.assertIn("undeclared_name", src_render)
@@ -891,7 +908,7 @@ class TestCfg(unittest.TestCase):
       lidx = UOp.special(1, "lidx0")
       gidx = UOp.special(1, "gidx0")
       sink = UOp.sink(out.base, lidx, gidx, arg=KernelInfo(name=name))
-      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp(Ops.INS, arg=(x, dtypes.void)) for x in insts]))))
+      return UOp(Ops.PROGRAM, src=(sink, UOp(Ops.LINEAR, src=tuple([UOp.native(x).call() for x in insts]))))
     with save_viz() as viz:
       with Context(DEV=f"NULL::{target}"):
         out = Tensor.custom_kernel(Tensor.empty(1), fxn=fxn)[0]
@@ -1175,17 +1192,13 @@ class TestCLI(unittest.TestCase):
         Tensor.realize(*f(a[:i], b[:j]))
     with write_files(viz) as files:
       out = run_cli(*files, "-s", "NULL")
-      aggregate = run_cli(*files, "-s", "NULL", "-t")
-    self.assertEqual(len(out), 3*2)
-    # Operation count increases with N; FLOPS is a rate and also depends on the measured duration.
-    gflops = [row["fmt"]["FLOPS"] for row in out]
-    flops = [rate * row["dur_ms"] * 1e-3 for rate, row in zip(gflops, out)]
-    self.assertGreater(flops[4], flops[2])
-    self.assertGreater(flops[5], flops[3])
-    # aggregate flops
-    self.assertEqual(len(aggregate), 2)
-    agg_gflops = [row["fmt"]["FLOPS"] for row in aggregate]
-    assert all(min(gflops) < v < max(gflops) for v in agg_gflops), f"{agg_gflops}"
+      summary, = run_cli(*files, "-s", "NULL", "-t")
+    # Six calls share one kernel. Each contributes its own operation count to the aggregate rate.
+    ops = [row["fmt"]["FLOPS"] * row["dur_ms"] * 1e-3 for row in out]
+    for got, expected in zip(ops, [2*n*n*64 for pair in test_n for n in pair], strict=True):
+      self.assertAlmostEqual(got, expected, delta=expected*1e-3)
+    self.assertEqual(summary["count"], len(ops))
+    self.assertAlmostEqual(summary["fmt"]["FLOPS"], sum(ops)/(summary["dur_ms"] * 1e-3), delta=1)
 
   def test_dedup(self):
     with save_viz() as viz:
@@ -1268,7 +1281,7 @@ class TestCLI(unittest.TestCase):
 
   @needs_tracked_pm
   def test_nested_calls_schedule_ls(self):
-    from tinygrad.schedule import schedule_cache
+    from tinygrad.codegen import schedule_cache
     @function(precompile=True)
     def inner(x:Tensor): return (x+x).contiguous()
     @function(precompile=True)

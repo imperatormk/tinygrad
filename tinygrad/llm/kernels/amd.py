@@ -1,4 +1,3 @@
-from __future__ import annotations
 import functools, math
 from typing import cast
 from tinygrad import Tensor, UOp, nn, Device, Context
@@ -33,12 +32,12 @@ def _gfx_version(device:str|tuple[str, ...]|None) -> tuple[int, ...]:
 def _is_rdna4(device:str|tuple[str, ...]|None) -> bool: return _gfx_version(device)[0] == 12
 def _is_cdna(device:str|tuple[str, ...]|None) -> bool: return _gfx_version(device)[0] == 9
 
-def warp_reduce(val:UOp, maximum:bool=False, full_wave:bool=False) -> UOp:
-  for offset in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)):
-    if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
-    other = UOp.custom_function(f"__builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, {{0}}), {0x1f | offset<<10}))",
-                                shape=val.shape, dtype=dtypes.float, fmt=True).call(val)
-    val = val.maximum(other) if maximum else val + other
+def warp_reduce(val:UOp, op:Ops=Ops.ADD, full_wave:bool=False, masks:tuple[int, ...]|None=None) -> UOp:
+  if val.op is Ops.INDEX and val.addrspace == AddrSpace.REG: val = val.load()
+  assert val.dtype in (dtypes.float32, dtypes.int32, dtypes.uint32)
+  for mask in ((16, 8, 4, 2, 1) if full_wave else (8, 4, 2, 1)) if masks is None else masks:
+    swizzle = UOp.native(f"__builtin_amdgcn_ds_swizzle({{0}}, {0x1f | mask<<10})", shape=val.shape, dtype=dtypes.int32, fmt=True)
+    val = val.alu(op, swizzle.call(val.bitcast(dtypes.int32)).bitcast(val.dtype))
   return val
 
 def _reg(shape:tuple[int, ...], value:float, dep:UOp|None=None) -> UOp:
@@ -71,9 +70,10 @@ class Linear(nn.Linear):
   shard_axis:int|None = None
   weight_scale_inv:Tensor|None = None
   weight_block_size:tuple[int, int] = (128, 128)
-  def __init__(self, in_features:int, out_features:int, bias=True):
+  def __init__(self, in_features:int, out_features:int, bias=True, groups:int=1):
     super().__init__(in_features, out_features, bias)
-    self.in_features, self.out_features = in_features, out_features
+    # groups > 1: x is (..., groups, in_features), group g multiplies the g-th block of out_features//groups weight rows
+    self.in_features, self.out_features, self.groups = in_features, out_features, groups
   def set_quantized(self, decoded:Tensor):
     from tinygrad.llm.kernels.amd_gguf import find_packed
     if (found:=find_packed(decoded, self.in_features)) is None: return
@@ -84,13 +84,14 @@ class Linear(nn.Linear):
     if self.weight_scale_inv is not None:
       out = fp8_matmul(x, self.weight, self.weight_scale_inv, self.weight_block_size)
       return out + self.bias if self.bias is not None else out
-    supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device)
+    grouped_ok = self.groups == 1 or (self.weight.uop.axis, x.uop.axis) in ((None, None), (0, x.ndim-2))
+    supported = self.use_custom_quant and amd_custom_kernels_supported(self.weight.device) and grouped_ok
     if self.ggml_type is None and supported:
       self.set_quantized(self.weight)
       if self.ggml_type is None:
         # tiny dense fp16 matmul (e.g. the ssm beta/alpha head rows): single fp16 gemv kernel instead of a
         # generic matmul schedule, and realize the densely packed weight once if it is still a lazy ggml view
-        if self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
+        if self.groups == 1 and self.weight.dtype in (dtypes.half, dtypes.float, dtypes.bfloat16) and self.out_features <= 2048 \
           and self.in_features % (WARP_SIZE*4) == 0 and self.weight.uop.axis is None:
           numel, max_shape = x.numel(), x.max_shape
           if isinstance(numel, int) or prod(max_shape) // self.in_features <= 32:
@@ -101,7 +102,10 @@ class Linear(nn.Linear):
       if isinstance(x.numel(), int): return q8_linear(self, x)
       # symbolic token count: pad to the max chunk size so the kernels see static shapes, garbage rows are sliced off
       out = q8_linear(self, x.pad_to(x.max_shape))
-      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features)))
+      return out.shrink(tuple((0, s) for s in (*x.shape[:-1], self.out_features // self.groups)))
+    if self.groups > 1:
+      out = (x.unsqueeze(-2) @ self.weight.reshape(self.groups, -1, self.in_features).transpose(-1, -2)).squeeze(-2)
+      return out if self.bias is None else out + self.bias.reshape(self.groups, -1)
     return super().__call__(x)
 
 class ExpertWeights:
@@ -194,7 +198,7 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
   qf = tuple(_vec_load(q[b, kv_head*G+h, 0, lane*DPL], DPL) for h in range(G))
   zerof = UOp.const(0, dtypes.float)
   # Each block scans every PARTIALS-th chunk, keeping an online softmax across rounds.
-  chunk_round = UOp.range((total_chunks-1-block_chunk)//PARTIALS+1, 4, AxisType.LOOP)
+  chunk_round = UOp.range((total_chunks-1-block_chunk)//PARTIALS+1, 4)
   chunk_id = block_chunk + chunk_round*PARTIALS
   valids: list[UOp] = []
   scores: list[list[UOp]] = [[zerof]*G for _ in range(SEC)]
@@ -258,7 +262,7 @@ def _amd_flash_attention_decode_partial(out, stats, q, cache_kv, valid_kv_len, m
 def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UOp:
   # one wave per (batch, head, 64-dim tile): every lane redundantly weights its chunks; no cross-lane traffic
   live = _unbind(live)
-  B, H, C, D = cast(tuple[int, int, int, int], partial.shape)
+  B, H, C, D = partial.shape
   DT = 64 if D % 64 == 0 else WARP_SIZE  # dims per block
   assert D % DT == 0
   block_bh, block_dt = UOp.range(B*H, 0, AxisType.GLOBAL), UOp.range(D//DT, 1, AxisType.GLOBAL)
@@ -266,13 +270,13 @@ def _amd_flash_decode_combine(o:UOp, partial:UOp, stats:UOp, live:int|UOp) -> UO
   b, h = block_bh // H, block_bh % H
   NPD = DT // WARP_SIZE  # output dims per lane
   dims = tuple(block_dt*DT + lane*NPD + i for i in range(NPD))
-  chunk = UOp.range(live, 100, AxisType.LOOP)
+  chunk = UOp.range(live, 100)
   def iloop(ph, val): return ph.store(ph.const_like(val))
   chunk_max = UOp.alloc((1,), dtypes.float, addrspace=AddrSpace.REG)
   chunk_max_i = chunk_max.after(iloop(chunk_max, -math.inf))
   update0 = chunk_max_i.store(chunk_max_i.after(chunk).maximum(stats[b, h, chunk, 0].load())).end(chunk)
   chunk_max = chunk_max_i.after(update0)
-  chunk2 = UOp.range(live, 101, AxisType.LOOP)
+  chunk2 = UOp.range(live, 101)
   acc = UOp.alloc((NPD,), dtypes.float, addrspace=AddrSpace.REG)
   weight_sum = UOp.alloc((1,), dtypes.float, addrspace=AddrSpace.REG)
   acc_i, weight_sum_i = acc.after(iloop(acc, 0)), weight_sum.after(iloop(weight_sum, 0))
@@ -328,7 +332,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   QP_lds = UOp.alloc((BLOCK_M, D + LDS_PAD), dtypes.half, addrspace=AddrSpace.LOCAL)
   KV_lds = UOp.alloc((BLOCK_N, D + LDS_PAD), dtypes.half, addrspace=AddrSpace.LOCAL)[:, :D]
   acc, m_i, l_i = _reg((TM, TD), 0), _reg((TM,), -math.inf), _reg((TM,), 0)
-  n_tile = UOp.range(((q_base + (block_m + 1) * BLOCK_M).minimum(valid_kv_len) + BLOCK_N - 1) // BLOCK_N, 100, AxisType.LOOP)
+  n_tile = UOp.range(((q_base + (block_m + 1) * BLOCK_M).minimum(valid_kv_len) + BLOCK_N - 1) // BLOCK_N, 100)
   Q_lds = QP_lds[:, :D]
   Q_store = Q_lds.after(n_tile).reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid].store(q.reshape(THREADS_PER_BLOCK, Q_ELEMS_PER_THREAD)[tid])
   load_k = UOp.range(KV_ELEMS_PER_THREAD, 90)
@@ -336,7 +340,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   K_store = KV_lds.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_k].store(kval).end(load_k)
   Q_lds, KV_lds_k = Q_lds.after(Q_store, K_store), KV_lds.after(Q_store, K_store)
   S_reg = _reg((TM, TN), 0, n_tile)
-  k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101, AxisType.LOOP), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
+  k_qk, tm1, tn1 = UOp.range(D//WMMA_K, 101), UOp.range(TM//WMMA_ACC, 200), UOp.range(TN, 201)
   S_frag = S_reg.reshape(TM // WMMA_ACC, WMMA_ACC, TN).permute(0, 2, 1)[tm1, tn1]
   q_frag = Q_lds.reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, D // WMMA_K, WMMA_K)[wave_m, tm1, lane_n, k_qk]
   k_frag = KV_lds_k.reshape(TN, WMMA_N, D // WMMA_K, WMMA_K)[tn1, lane_n, k_qk]
@@ -349,10 +353,10 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   k_idx = n_tile * BLOCK_N + rn * LANES_PER_WAVE_N + lane_n
   causal = (k_idx <= q_idx) & (k_idx < valid_kv_len)
   S_reg = S_reg.after(S_reg[rm, rn].store(causal.where(S_reg[rm, rn], S_reg[rm, rn].const_like(-math.inf))).end(rm, rn))
-  m_ij, rm2 = _reg((TM,), -math.inf, n_tile), UOp.range(TN, 261, AxisType.LOOP)
+  m_ij, rm2 = _reg((TM,), -math.inf, n_tile), UOp.range(TN, 261)
   m_ij = m_ij.after(m_ij.store(m_ij.after(rm2).maximum(S_reg[:, rm2])).end(rm2))
   ri_w = UOp.range(TM, 270)
-  m_ij = m_ij.after(m_ij[ri_w].store(warp_reduce(m_ij[ri_w], maximum=True)).end(ri_w))
+  m_ij = m_ij.after(m_ij[ri_w].store(warp_reduce(m_ij[ri_w], Ops.MAX)).end(ri_w))
   tile_max = m_ij.reshape(TM, 1).expand(TM, TN).maximum(-1e30)
   S_reg = S_reg.after(S_reg.store(((S_reg - tile_max) * LOG2E).exp2()))
   p_local, ri_ws = _reg((TM,), 0, n_tile), UOp.range(TM, 295)
@@ -378,7 +382,7 @@ def _amd_flash_attention(o:UOp, q:UOp, cache:UOp, valid_kv_len:int|UOp, q_start:
   V_store = V_copy.reshape(THREADS_PER_BLOCK, KV_ELEMS_PER_THREAD)[tid, load_v].store(vval).end(load_v)
   P_lds, V_lds = P_lds.after(P_store, V_store), V_lds.after(P_store, V_store)
   pv_acc = _reg((TM, TD), 0, n_tile)
-  k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400, AxisType.LOOP), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
+  k_pv, tm2, tn2 = UOp.range(BLOCK_N//WMMA_K, 400), UOp.range(TM//WMMA_ACC, 401), UOp.range(TD, 402)
   pv_frag = pv_acc.reshape(TM // WMMA_ACC, WMMA_ACC, TD).permute(0, 2, 1)[tm2, tn2]
   p_frag = P_lds[wave_n].reshape(WAVES_M, TM // WMMA_ACC, WMMA_M, BLOCK_N // WMMA_K, WMMA_K)[wave_m, tm2, lane_n, k_pv]
   v_frag = V_lds.reshape(WAVES_N, TD, WMMA_N, BLOCK_N // WMMA_K, WMMA_K)[wave_n, tn2, lane_n, k_pv]
@@ -426,19 +430,18 @@ def _gated_delta_prefill_kernel(core:UOp, q:UOp, k:UOp, v:UOp, beta:UOp, alpha:U
   batch, heads, tokens, value_dim, row_tile = *core.shape, 4
   key_dim, alpha_dim = q.shape[-1], alpha.shape[-1] if len(alpha.shape) == 4 else 1
   assert all(isinstance(x, int) for x in (batch, heads, tokens, value_dim, key_dim)) and key_dim % 32 == 0 and value_dim % row_tile == 0
-  batch, heads, tokens, value_dim, key_dim = cast(tuple[int, int, int, int, int], (batch, heads, tokens, value_dim, key_dim))
   core, v = (x.reshape(batch*heads, tokens, value_dim) for x in (core, v))
   q, k = (x.reshape(batch*heads, tokens, key_dim) for x in (q, k))
   beta, kq = (x.reshape(batch*heads, tokens) for x in (beta, kq))
   alpha, state = alpha.reshape(batch*heads, tokens, alpha_dim), state.reshape(batch*heads, value_dim, key_dim)
-  bh_row, lane = UOp.range(batch*heads*value_dim//row_tile, 0), UOp.range(32, 1, axis_type=AxisType.LOCAL)
+  bh_row, lane = UOp.range(batch*heads*value_dim//row_tile, 0, AxisType.GLOBAL), UOp.range(32, 1, axis_type=AxisType.LOCAL)
   bh, row_base = bh_row // (value_dim//row_tile), (bh_row % (value_dim//row_tile))*row_tile
   rows, cols = tuple(row_base+i for i in range(row_tile)), tuple(lane + i*32 for i in range(key_dim//32))
   current = UOp.alloc((row_tile*key_dim//32,), dtypes.float32, addrspace=AddrSpace.REG)
   initial = None if start_pos is None else start_pos.eq(0)
   current = current.after(current.store(UOp.stack(*(state[bh, row, col].float() if initial is None else
     initial.where(0, state[bh, row, col].float()) for row in rows for col in cols))))
-  token = UOp.range(tokens, 2, AxisType.LOOP)
+  token = UOp.range(tokens, 2)
   keys = tuple(k[bh, token, col].load() for col in cols)
   queries = tuple(q[bh, token, col].load() for col in cols)
   updates, stores = [], []

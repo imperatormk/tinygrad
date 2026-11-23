@@ -13,7 +13,7 @@ from tinygrad.runtime.autogen.amd.cdna.ins import s_nop as s_nop_cdna
 
 _arch_map = {"gfx9": "cdna", "gfx10": "rdna3", "gfx11": "rdna3", "gfx12": "rdna4"}
 def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
-  insts = [u.arg[0] for u in lin.src]
+  insts = [u.body.arg.code for u in lin.src]
 
   # ** scan for max vgpr/sgpr/accvgpr
   max_vgpr, max_sgpr, max_accvgpr = 0, 0, 0
@@ -41,8 +41,8 @@ def assemble_linear(prg:UOp, lin:UOp, arch:str) -> bytes:
   wave32 = not is_cdna
   for u in sink.toposort():
     if u.op is Ops.PARAM: param_sizes[u.arg.slot] = u.dtype.itemsize if u.addrspace is AddrSpace.ALU else 8
+    elif u.op is Ops.BUFFER and u.addrspace is AddrSpace.LOCAL and u.arg.name == "scratch": scratch_size += u.max_numel() * u.dtype.itemsize
     elif u.op is Ops.BUFFER and u.addrspace is AddrSpace.LOCAL: lds_size += u.max_numel() * u.dtype.itemsize
-    elif u.op is Ops.ALLOC and u.addrspace is AddrSpace.GLOBAL and u.arg.name == "scratch": scratch_size += u.max_numel() * u.dtype.itemsize
     elif u.op is Ops.SPECIAL and u.arg.startswith("gidx"): gids.add(int(u.arg[-1]))
     elif u.op is Ops.RANGE and u.axis_type is AxisType.WARP and u.src[0].arg == 64: wave32 = True
   code_bytes = b"".join(inst.to_bytes() for inst in insts)

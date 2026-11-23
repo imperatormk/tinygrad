@@ -40,13 +40,17 @@ def fold_divmod_general(d: UOp) -> UOp|None:
     terms, factors = zip(*decomp)
 
     # fold_divmod_congruence: fold if a is congruent to an expression whose range is between 0 and c
-    # try both signs of the remainder for a lone term (covers a binary numerator that crosses one period)
-    # or on an exact f%c == c//2 tie; otherwise pick the smaller to keep the product over terms small
-    rem_choices = [(r, r-c) if (r:=f%c)*2 == c or len(terms)==1 else (min(r, r-c, key=abs),) for f in factors]
+    # each term takes the remainder r or r-c with the smaller abs, keeping the range narrow
+    # both are tried for a lone term, and for the only varying term with r == c/2 (two such terms span c and never fold)
+    ties = [i for i,(f,v) in enumerate(zip(factors,terms)) if (f%c)*2 == c and v.vmin != v.vmax]
+    rem_choices = [(r, r-c) if len(terms)==1 or ties==[i] else (min(r, r-c, key=abs),) for i,r in enumerate(f%c for f in factors)]
     for rems in itertools.product(*rem_choices):
-      if (rem:=sum(r*v for r,v in zip(rems,terms))+const%c).vmin//c==rem.vmax//c:
-        if d.op is Ops.MOD: return rem - rem.vmin//c*c
-        return sum((f-r)//c * v for f,r,v in zip(factors,rems,terms)) + const//c + rem.vmin//c
+      # the range of rem = sum(r*v)+const%c, computed before building it
+      ends = [sorted((r*v.vmin, r*v.vmax)) for r,v in zip(rems,terms)]
+      lo, hi = sum(e[0] for e in ends)+const%c, sum(e[1] for e in ends)+const%c
+      if lo//c == hi//c:
+        if d.op is Ops.MOD: return sum(r*v for r,v in zip(rems,terms))+const%c - lo//c*c
+        return sum((f-r)//c * v for f,r,v in zip(factors,rems,terms)) + const//c + lo//c
 
     # nest_by_factor: x//c -> (x//f)//(c//f), x%c -> (x//f%(c//f))*f + b where b=x%f
     # f is a term factor dividing c or the gcd of all factors and c

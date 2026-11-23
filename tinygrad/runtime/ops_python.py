@@ -7,8 +7,8 @@ import pickle, base64, itertools, time, sys, ctypes
 from dataclasses import replace
 from tinygrad.dtype import bitcast, DType, dtypes, AddrSpace, truncate, storage_fmt_for_dtype, to_storage_scalar, from_storage_scalar
 from tinygrad.helpers import all_same, getenv, Target, IMAGE, is_image_shape, to_mv, mv_address
-from tinygrad.device import HostAllocator, Compiled, Compiler, Program, TinyELF
-from tinygrad.renderer import tc, Renderer
+from tinygrad.device import HostAllocator, Compiled, Program
+from tinygrad.renderer import tc, Renderer, Compiler, TinyELF
 from tinygrad.uop.ops import exec_alu, python_alu, Ops, UOp, GroupOp
 from tinygrad.runtime.support.elf import link_sym
 from tinygrad.runtime.support.c import DLL
@@ -78,7 +78,7 @@ class PythonProgram(Program['PythonDevice']):
           exec_masks.pop()
           i += 1
           continue
-        if u.op in (Ops.BARRIER, Ops.SINK, Ops.NOOP, Ops.CUSTOM_FUNCTION) or (u.op is Ops.RANGE and u.dtype == dtypes.void) or u in env \
+        if u.op in (Ops.BARRIER, Ops.SINK, Ops.NOOP, Ops.NATIVE) or (u.op is Ops.RANGE and u.dtype == dtypes.void) or u in env \
           or (u.op is Ops.AFTER and u.dtype is dtypes.void):
           # in the python emulator, the warp is always in sync
           i += 1
@@ -145,7 +145,7 @@ class PythonProgram(Program['PythonDevice']):
           values[u] = [self.links[u.body.src[0].arg.function_name](env={p: values[u.src[p.arg.slot+1]] for p in u.body.arg.params})]
         elif u.op is Ops.CALL: # a C function by symbol, linked against the loaded libraries
           restype = None if u.dtype is dtypes.void else getattr(ctypes, f"c_{'u' if u.dtype in dtypes.uints else ''}int{u.dtype.bitsize}")
-          cfunc = ctypes.CFUNCTYPE(restype, *[ctypes.c_uint64] * len(src_values))(link_sym(u.src[0].arg.name, list(DLL._loaded_.values())))
+          cfunc = ctypes.CFUNCTYPE(restype, *[ctypes.c_uint64] * len(src_values))(link_sym(u.body.arg.code, list(DLL._loaded_.values())))
           values[u] = []
           for args,gate in zip(zip(*src_values), exec_masks[-1]):
             call_args = [(mv_address(x[0]) + x[1]*dt.itemsize) if isinstance(x, tuple) else x for x,dt in zip(args, src_dtypes)]
@@ -185,5 +185,6 @@ class PythonRenderer(Renderer):
   def supported_dtypes(self): return {d for d in super().supported_dtypes() if d != dtypes.half or sys.version_info >= (3, 12)}
 
 class PythonDevice(Compiled):
+  renderers = [PythonRenderer]
   def __init__(self, device:str):
-    super().__init__(device, HostAllocator(self), [PythonRenderer], PythonProgram)
+    super().__init__(device, HostAllocator(self), PythonProgram)

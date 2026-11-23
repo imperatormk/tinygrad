@@ -20,7 +20,7 @@ class TestIselX86(unittest.TestCase):
       with self.subTest(dtype=dt):
         v = [UOp.variable(str(i), 0, 0, dt) for i in range(nargs)]
         n = self.isel_rewrite(expr(*v))
-        self.assertIs(n.arg[0], op)
+        self.assertIs(n.body.arg.code, op)
 
   def test_cmove(self):
     a = UOp.variable("a", 0, 0, dtypes.int32)
@@ -29,9 +29,11 @@ class TestIselX86(unittest.TestCase):
     d = a.alu(Ops.CMPNE, b).where(a, b)
     f = c + d
     n = self.isel_rewrite(f)
-    self.assertTrue(n.src[0].arg[0] is X86Ops.CMOVL and n.src[1].arg[0] is X86Ops.CMOVNE)
-    # both comparisons become the same instruction
-    self.assertTrue(n.src[0].src[2] == n.src[1].src[2] and n.src[0].src[2].arg[0] is X86Ops.CMP)
+    ops = [u.body.arg.code for u in n.toposort() if u.op is Ops.CALL]
+    self.assertEqual(ops.count(X86Ops.CMOVNE), 2)
+    self.assertEqual(ops.count(X86Ops.SETL), 1)
+    self.assertEqual(ops.count(X86Ops.SETNE), 1)
+    self.assertEqual(ops.count(X86Ops.CMP), 1)
 
   def test_vinsertps(self):
     a = UOp.variable("a", 0, 0, dtypes.float32)
@@ -41,7 +43,7 @@ class TestIselX86(unittest.TestCase):
 
     valid = [UOp.stack(lane(a, 0), lane(b, 1), lane(a, 2), lane(b, 3)),
              UOp.stack(lane(a, 3), lane(b, 2), lane(c, 1), d)]
-    for shuf in valid: self.assertIs(self.isel_rewrite(shuf).arg[0], X86Ops.VINSERTPS)
+    for shuf in valid: self.assertIs(self.isel_rewrite(shuf).body.arg.code, X86Ops.VINSERTPS)
 
   # complex address is [base + index*scale + displacement]
   def test_complex_address(self):
@@ -49,11 +51,18 @@ class TestIselX86(unittest.TestCase):
     load = UOp.param(0, dtypes.int32, 16).index(a + UOp.cconst(1, dtypes.int32)).load()
     n = self.isel_rewrite(load)
     # displacement is the constant in "a" scaled to the buffer element size, dtype is int8 when the value fits otherwise int32
-    self.assertTrue(n.src[2].dtype is dtypes.int8 and n.src[2].src[0].op is Ops.CONST and n.src[2].src[0].val == 4)
+    self.assertTrue(n.src[3].dtype is dtypes.int8 and n.src[3].src[0].op is Ops.CONST and n.src[3].src[0].val == 4)
 
   @Context(SPEC=2, NOOPT=1)
   def test_register_store_is_effect(self):
     to_program(Tensor.empty(16, 16).sum(1).schedule_linear().src[-1].src[0], X86Renderer(Target(device="CPU", arch="x86_64")))
+
+  def test_register_casts(self):
+    renderer = X86Renderer(Target(device="CPU", arch="x86_64"))
+    for t in (Tensor.empty(16, dtype=dtypes.uint32).cast(dtypes.int64), Tensor.empty(16) < Tensor.empty(16)):
+      sink = to_program(t.schedule_linear().src[-1].src[0], renderer).src[0]
+      for u in sink.toposort():
+        if u.op is Ops.BITCAST: self.assertEqual(u.dtype.itemsize, u.src[0].dtype.itemsize)
 
 if __name__ == "__main__":
   unittest.main()

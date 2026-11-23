@@ -7,6 +7,7 @@ from tinygrad.uop.ops import UOp, Ops, GroupOp, UPat, KernelInfo
 from tinygrad.dtype import AddrSpace
 from tinygrad.engine.realize import run_linear, compile_linear
 from tinygrad.codegen import to_program, full_rewrite_to_sink
+from tinygrad.codegen import pm_copy_from_store
 from test.helpers import check_schedule, KernelCountException, jit_cache_count, measure_mem
 
 def _realize_weights(m):
@@ -249,6 +250,11 @@ class TestSchedule(unittest.TestCase):
     with Context(SPLIT_REDUCEOP=1):
       out = (x - x.max(keepdim=True)).max()
       check_schedule(out, 3)
+
+  def test_split_reduceop_inverse_reshapes(self):
+    x = Tensor.empty(3, *[2]*18).realize()
+    with Context(SPLIT_REDUCEOP=1):
+      check_schedule(x.reshape(*[2]*18, 3).reshape(3, *[2]*18).sum(), 1)
 
   def test_example_matmul_contig(self):
     x = Tensor.eye(64).clone().realize()
@@ -850,6 +856,26 @@ class TestSchedule(unittest.TestCase):
     b = Tensor.empty((1,), device="NULL:1").expand(10).contiguous()
     c = a+b
     with self.assertRaisesRegex(RuntimeError, "all buffers must be on the same device"): check_schedule(c, 2)
+
+  def _lower_copy_kernel(self, fxn):
+    dst, src = Tensor.empty(8, dtype=dtypes.int, device="NULL"), Tensor.empty(8, dtype=dtypes.int, device="NULL:1")
+    ast = fxn(dst.uop.param_like(0), src.uop.param_like(1)).sink(arg=KernelInfo(opts_to_apply=()))
+    return pm_copy_from_store.rewrite(ast.call(dst.uop, src.uop))
+
+  # a kernel that copies part of a buffer is not a whole-buffer copy, so the cross-device kernel is rejected
+  def test_error_on_partial_copy(self):
+    r = UOp.range(4, 0)
+    with self.assertRaisesRegex(RuntimeError, "same device"):
+      self._lower_copy_kernel(lambda p,q: p.index(r).store(q.index(r)).end(r))
+
+  def test_error_on_partial_copy_gated(self):
+    r = UOp.range(8, 0)
+    with self.assertRaisesRegex(RuntimeError, "same device"):
+      self._lower_copy_kernel(lambda p,q: p.index(r.valid(r<4)).store(q.index(r)).end(r))
+
+  def test_error_on_partial_copy_zero(self):
+    with self.assertRaisesRegex(RuntimeError, "same device"):
+      self._lower_copy_kernel(lambda p,q: p.index(0).store(q.index(0)))
 
   def test_rand(self):
     x = Tensor.rand(32)

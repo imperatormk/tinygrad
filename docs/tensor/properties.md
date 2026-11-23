@@ -21,6 +21,9 @@
 
 ::: tinygrad.Tensor.linear_with_vars
 ::: tinygrad.Tensor.schedule_linear
+::: tinygrad.Tensor.export
+::: tinygrad.Tensor.compile
+::: tinygrad.Tensor.run
 ::: tinygrad.Tensor.realize
 ::: tinygrad.Tensor.replace
 ::: tinygrad.Tensor.assign

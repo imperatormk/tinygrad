@@ -1,12 +1,53 @@
 from __future__ import annotations
-import functools
-from typing import Callable, cast
+from typing import Callable, Generator, cast
+import functools, subprocess, pathlib, struct
 from dataclasses import dataclass, replace
-from tinygrad.helpers import prod, Target, EMULATED_DTYPES
+from tinygrad.helpers import prod, Target, EMULATED_DTYPES, CCACHE, getenv, diskcache_get, diskcache_put, unwrap, round_up
 from tinygrad.uop.ops import Ops, UOp, sint, ssimplify, smin, GroupOp, PatternMatcher
 from tinygrad.dtype import AddrSpace, DType, dtypes
 from tinygrad.renderer.tc import TensorCore
-from tinygrad.device import Compiler
+
+class CompileError(Exception): pass
+
+class Compiler:
+  def __init__(self, cachekey:str|None=None): self.cachekey = cachekey if CCACHE else None
+  def compile(self, src:str) -> bytes: return src.encode()   # NOTE: empty compiler is the default
+  def compile_cached(self, src:str) -> bytes:
+    if self.cachekey is None or (lib := diskcache_get(self.cachekey, src)) is None:
+      assert not getenv("ASSERT_COMPILE"), f"tried to compile with ASSERT_COMPILE set\n{src}"
+      lib = self.compile(src)
+      if self.cachekey is not None: diskcache_put(self.cachekey, src, lib)
+    return lib
+  def disassemble(self, lib:bytes): pass
+  def server(self, cmd:str, arch:str, *args) -> subprocess.Popen:
+    argv = f"{cmd} {pathlib.Path(__file__).parent.parent}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}"
+    return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
+  def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
+    unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
+    if (lib:=unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])): return lib
+    raise CompileError("Compilation Error")
+
+
+@dataclass
+class TinyELF:
+  lib: bytes
+  name: str
+  target: Target
+  # tuple of (name, addrspace, dtype, shape), one per arg in the kernel's order. an ALU arg is a value, the rest are buffers
+  signature: tuple[tuple[str|None, AddrSpace, DType, tuple], ...]
+  profile_key: bytes|None = None
+
+  @staticmethod
+  def from_program(prg:UOp) -> TinyELF:
+    sig = tuple((p.arg.name, p.arg.addrspace, p.dtype, p._shape) for p in prg.kernel_params)
+    return TinyELF(prg.src[3].arg, prg.src[0].arg.function_name, prg.arg.target, sig, prg.key)
+
+  @staticmethod
+  def iter_sig(signature:tuple[tuple[str|None, AddrSpace, DType, tuple], ...], offset:int=0) -> Generator[tuple[int, DType], None, None]:
+    for _,a,dt,_ in signature:
+      if a is not AddrSpace.ALU: dt = dtypes.uint64 # a buffer is passed by its address
+      yield (offset:=round_up(offset, dt.itemsize)), dt
+      offset += dt.itemsize
 
 # an access takes its dtype from the buffer it indexes, so accessing at another dtype restates the storage on the buffer that owns it
 def with_storage(x:UOp, dt:DType) -> UOp:
@@ -30,11 +71,9 @@ class Estimates:
     mem: dict[tuple[UOp, Ops], sint] = {}
     mults: sint = 1
     mult_stack: list[sint] = []
-    excluded: set[UOp] = set()
-    if ignore_indexing:
-      for u in uops:
-        if u.op in {Ops.INDEX, Ops.SHRINK}:
-          excluded = excluded.union(set(UOp.sink(*u.src[1:]).toposort(lambda x: x.op not in {Ops.END, Ops.BACKEDGE})))
+    # ALUs used for indexing don't count as flops. the toposort stops at END/BACKEDGE so loop bodies still count
+    idxs = [s for u in uops if u.op in {Ops.INDEX, Ops.SHRINK} for s in u.src[1:]] if ignore_indexing else []
+    excluded = UOp.sink(*idxs).toposort(lambda x: x.op not in {Ops.END, Ops.BACKEDGE})
     for u in uops:
       if u.op in {Ops.LOAD, Ops.STORE}:
         buf = u
@@ -47,7 +86,7 @@ class Estimates:
         mult_stack.append(mults)
         if u.dtype is not dtypes.void:  # unbounded loop, unknown trip count
           bound = u.src[0].without_after.simplify()
-          mults *= cast(sint, bound.vmax if bound.ranges else bound.ssimplify())
+          mults *= bound.vmax if bound.ranges else bound.ssimplify()
           # SPECIAL are already counted in mults
           mults = mults.substitute({x:x.const_like(0) for x in mults.toposort() if x.op is Ops.SPECIAL}) if isinstance(mults, UOp) else mults
       elif u.op in {Ops.END, Ops.BACKEDGE}: mults = mult_stack.pop(-1)

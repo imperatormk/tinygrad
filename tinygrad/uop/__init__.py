@@ -16,8 +16,8 @@ class Ops(FastEnum):
   # this is a RANGE for GPU dimensions, similar to symbolic shapes but not exactly
   SPECIAL = auto()
 
-  # BUFFER references bound storage; ALLOC declares unbound global storage
-  BUFFER = auto(); ALLOC = auto()
+  # BUFFER references bound storage; ALLOC declares unbound global storage; EXTERN is storage from outside an exported function
+  BUFFER = auto(); ALLOC = auto(); EXTERN = auto()
 
   # ** 2 -- non op uops **
 
@@ -75,16 +75,13 @@ class Ops(FastEnum):
   # const.
   CONST = auto()
 
-  # INS is a machine instruction
-  INS = auto()
-
   # ** 6 -- ops that don't exist in programs **
 
   # ops that adjust the behavior of the scheduler
   CONTIGUOUS_BACKWARD = auto(); DETACH = auto()
 
   # buffer ops
-  STAGE = auto(); COPY = auto(); MSELECT = auto(); MSTACK = auto(); CUSTOM_FUNCTION = auto()
+  STAGE = auto(); COPY = auto(); MSELECT = auto(); MSTACK = auto(); NATIVE = auto()
 
   # the core 5 movement ops! these only exist in the tensor graph
   RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto()
@@ -109,7 +106,7 @@ class GroupOp:
   Elementwise = set.union(ALU, {Ops.CAST, Ops.BITCAST})
   UnaryElementwise = Unary | {Ops.CAST}
 
-  Defines = {Ops.PARAM, Ops.REFPARAM, Ops.BUFFER, Ops.ALLOC, Ops.BINARY}
+  Defines = {Ops.PARAM, Ops.REFPARAM, Ops.BUFFER, Ops.ALLOC, Ops.EXTERN, Ops.BINARY}
 
   Irreducible = {Ops.CONST, Ops.SPECIAL, Ops.RANGE, Ops.PARAM, Ops.GETADDR}
   Movement = {Ops.RESHAPE, Ops.EXPAND, Ops.PERMUTE, Ops.PAD, Ops.SHRINK}

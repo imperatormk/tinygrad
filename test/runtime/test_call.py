@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from tinygrad import Tensor, function, Device
+from tinygrad import Tensor, function, Device, Variable
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType, uopfunc
 from tinygrad.engine.realize import run_linear, get_runtime
@@ -9,11 +9,28 @@ from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import getenv
 from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.renderer.llvmir import LLVMRenderer
-from tinygrad.schedule import transform_to_call
 
-def sched_key(t:Tensor): return transform_to_call(UOp.sink(t.uop)).body.key
+def sched_key(t:Tensor): return t.export()[0].key
 
 class TestCall(unittest.TestCase):
+  def test_named_scalar_is_its_arg(self):
+    # a named scalar param that isn't a Variable gets the call's arg at its slot
+    out = Tensor.empty(1, dtype=dtypes.int).realize()
+    p, n = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.int, name="n", addrspace=AddrSpace.ALU)
+    prg = to_program(p.index(UOp.const(0)).store(n).sink(arg=KernelInfo("named_scalar")), Device[Device.DEFAULT].renderer)
+    run_linear(UOp(Ops.LINEAR, src=(prg.call(out.uop.buf_uop, UOp.const(42, dtypes.int)),)))
+    self.assertEqual(out.item(), 42)
+
+  def test_scalar_arg_after_call(self):
+    # a scalar arg after a call orders its kernel after that call
+    x, y, z = [Tensor([0], dtype=dtypes.int).realize().uop.buf_uop for _ in range(3)]
+    p, q, r = UOp.param(0, dtypes.int, 1), UOp.param(1, dtypes.int, 1), UOp.param(2, dtypes.int, 1)
+    v = UOp.param(1, dtypes.int, vmin_vmax=(1, 10), name="v", addrspace=AddrSpace.ALU)
+    init = p[0].store(UOp.const(1, dtypes.int)).sink(arg=KernelInfo("init")).call(x)
+    producer = p[0].store(q[0]).sink(arg=KernelInfo("producer")).call(y, x.after(init))
+    consumer = p[0].store(v+r[0]).sink(arg=KernelInfo("consumer")).call(z, Variable("v", 1, 10, dtypes.int).bind(1).after(producer), y)
+    self.assertEqual(Tensor(z.after(consumer)).tolist(), [2])
+
   def test_call_plus(self):
     a = Tensor.randn(10, 10)
     b = Tensor.randn(10, 10)
@@ -127,6 +144,38 @@ class TestCallSchedule(unittest.TestCase):
     ref = np.zeros((4, 8), dtype=np.float32)
     ref[1:3, 2:6] = np.arange(8).reshape(2, 4) + 1
     np.testing.assert_equal(big.numpy(), ref)
+
+  def test_deviceless_body_storage_is_banned(self):
+    # global storage needs a device, a device agnostic body can't stage or allocate without one
+    x = Tensor([1., 2., 3., 4.]).realize()
+    p, tmp = UOp.param(0, dtypes.float, (4,)), UOp.alloc((4,), dtypes.float)
+    with self.assertRaisesRegex(RuntimeError, "global storage needs a device"):
+      Tensor(((p + 1).bufferize() * 2).call_with_output(x.uop, precompile=True)).realize()
+    with self.assertRaisesRegex(RuntimeError, "global storage needs a device"):
+      Tensor((tmp.after(tmp.store(p + 1)) * 2).call_with_output(x.uop)).realize()
+
+  def test_deviceless_call_keeps_grad_fxn(self):
+    # a call without a device is inlined where it's used, it still has its custom gradient
+    x = Tensor(3., dtype=dtypes.float)
+    y = Tensor.call(x, fxn=UOp.param(0, dtypes.float, ()) * 2, grad_fxn=lambda g, c: (g * 3,))
+    self.assertEqual(y.gradient(x)[0].item(), 3.0)
+    self.assertEqual(y.item(), 6.0)
+
+  def test_shared_buffer_across_call_bodies(self):
+    # the buffer read by one call and written by another is one EXTERN, so the read runs before the write
+    shared, x = Tensor([2.]).realize(), Tensor([10.]).realize()
+    p = UOp.param(0, dtypes.float, (1,), device=x.device)
+    read = Tensor((p * shared.uop).call_with_output(((x + 1).contiguous() + 1).uop))
+    write = Tensor(shared.uop.after(shared.uop.store(5)).call_with_output())
+    Tensor.realize(read, write)
+    self.assertEqual(read.tolist(), [24.])
+
+  def test_bound_var_in_body_not_rebound_by_slot(self):
+    # b is exported from the body as an EXTERN, its slot isn't a call position: it must not be rebound to the arg at slot 1 (a)
+    x = Tensor([10.]).realize()
+    a, b = UOp.variable("a", 1, 10).bind(2), UOp.variable("b", 1, 10).bind(3)
+    p = UOp.param(0, dtypes.float, (1,), device=x.device)
+    self.assertEqual(Tensor((p * a.param_like(1) + b).call_with_output(x.uop, a, b, precompile=True)).tolist(), [23.])
 
   def test_precompile_full_buffer_assign(self):
     @function(precompile=True)
@@ -247,12 +296,11 @@ class TestCallSchedule(unittest.TestCase):
   def test_precompile_scoped_bind_arg(self):
     @function(precompile=True)
     def f(x:Tensor, scale:UOp) -> Tensor: return x * scale
+    sa, sb = UOp.variable("scale_a", 1, 100).bind(2), UOp.variable("scale_b", 1, 100).bind(3)
+    self.assertEqual(sched_key(f(Tensor.ones(3), sa)), sched_key(f(Tensor.ones(3), sb)))
     a = Tensor.ones(3)
-    x = f(a, UOp.variable("scale_a", 1, 100).bind(2))
-    y = f(a, UOp.variable("scale_b", 1, 100).bind(3))
-    self.assertEqual(sched_key(x), sched_key(y))
-    np.testing.assert_equal(x.numpy(), [2, 2, 2])
-    np.testing.assert_equal(y.numpy(), [3, 3, 3])
+    np.testing.assert_equal(f(a, sa).numpy(), [2, 2, 2])
+    np.testing.assert_equal(f(a, sb).numpy(), [3, 3, 3])
 
   def test_precompile_nested_scope_collision(self):
     # a precompiled function body gets its own positional p{slot} params; they must not be renumbered when the call is
@@ -284,7 +332,7 @@ class TestCallSchedule(unittest.TestCase):
           out = outer(x)
           for call in (u for u in out.uop.toposort(enter_calls=True) if u.op is Ops.CALL):
             self.assertFalse(any(b.op is Ops.BUFFER for b in call.body.toposort(enter_calls=True)))
-          self.assertEqual(sched_key(out), sched_key(outer(x)))
+          self.assertEqual(sched_key(outer(x)), sched_key(outer(x)))
           out.sum().backward()
           np.testing.assert_equal(out.numpy(), [6., 9., 12., 15.])
           np.testing.assert_equal(x.grad.numpy(), [3., 3., 3., 3.])
@@ -476,6 +524,17 @@ class TestCallMultiSharded(unittest.TestCase):
                      or Device.DEFAULT == "AMD" and isinstance(Device[Device.DEFAULT].renderer, CStyleLanguage),
                      "calls in kernel not implemented in this renderer")
 class TestCallInKernel(unittest.TestCase):
+  def test_nested_call_captured_scalar(self):
+    # a call in the kernel captures a bound Variable, it's an arg of the call and then of the kernel
+    v = Variable("v", 1, 4, dtypes.int).bind(3)
+    @uopfunc
+    def add_v(out:UOp, x:UOp) -> UOp:
+      i = UOp.range(x.numel(), 0)
+      return out[i].store(x[i] + v).end(i).sink()
+    x = Tensor([1, 2], dtype=dtypes.int).realize()
+    out = Tensor.custom_kernel(Tensor.empty_like(x), x, fxn=lambda out,x: add_v(out, x).sink(arg=KernelInfo(name="add_v_kernel")))[0]
+    self.assertEqual(out.tolist(), [4, 5])
+
   def test_simple(self):
     N = getenv("N", 4)
 
@@ -508,7 +567,7 @@ class TestCallInKernel(unittest.TestCase):
     @uopfunc
     def update(S:UOp, A:UOp) -> UOp: return S[0].store(S[0]*10+A[0]).sink()
     def kernel(O:UOp, S:UOp, A:UOp) -> UOp:
-      a, k, b = [UOp.range(2, n, AxisType.LOOP) for n in range(3)]
+      a, k, b = [UOp.range(2, n) for n in range(3)]
       return O[0].store(A[a*2+b].after(update(S.after(k), A[a*2+b])).reduce(a, k, b, arg=Ops.ADD)).sink(arg=KernelInfo(opts_to_apply=()))
     o, s = Tensor.custom_kernel(Tensor.empty(1, dtype=dtypes.int), Tensor.zeros(1, dtype=dtypes.int).contiguous(),
                                 Tensor([1, 2, 3, 4], dtype=dtypes.int), fxn=kernel)[:2]
@@ -545,7 +604,7 @@ class TestCallInKernel(unittest.TestCase):
     def mul(p:UOp, q:UOp): return p[0].store(q[0]*3).sink()
 
     def kernel(C:UOp, A:UOp):
-      i = UOp.range(4, 0)
+      i = UOp.range(4, 0, AxisType.WEAK)
       call = mul(C[i], A[i])
       return call.end(i).sink(arg=KernelInfo(name="call_loop_mini", opts_to_apply=opts))
     a = Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
@@ -585,11 +644,11 @@ class TestCallInKernel(unittest.TestCase):
   def test_call_body_range_is_not_ours(self):
     @uopfunc
     def mul(out:UOp, A:UOp):
-      k = UOp.range(4, 0, AxisType.LOOP)
+      k = UOp.range(4, 0)
       return out[k].store(A[k]*3).end(k).sink()
 
     def kernel(C:UOp, A:UOp):
-      m, i, call = UOp.range(3, 1, AxisType.LOOP), UOp.range(4, 0, AxisType.LOOP), mul(C, A)
+      m, i, call = UOp.range(3, 1), UOp.range(4, 0), mul(C, A)
       self.assertIn(i, call.body.toposort())
       end_m = C.after(call)[m].store(A[m]).end(m)
       return C.after(end_m)[i].store(A[i]+1).end(i).sink(arg=KernelInfo(name="call_body_range", opts_to_apply=()))
@@ -620,7 +679,7 @@ class TestCallInKernel(unittest.TestCase):
   def test_uopfunc(self):
     @uopfunc
     def axpy(out:UOp, x:UOp, a:int) -> UOp: # a is a trace-time constant: two bodies, two C functions
-      i = UOp.range(x.shape[0], 0, AxisType.LOOP)
+      i = UOp.range(x.shape[0], 0)
       return out[i].store(out[i] + x[i] * a).end(i).sink()
 
     @uopfunc
@@ -628,7 +687,7 @@ class TestCallInKernel(unittest.TestCase):
 
     def kernel(C:UOp, A:UOp) -> UOp:
       C = C.after(triple(C.after(axpy(C, A, 2)), A))
-      i = UOp.range(A.shape[0], 1, AxisType.LOOP) # a loop after the calls
+      i = UOp.range(A.shape[0], 1) # a loop after the calls
       return C[i].store(C[i] + 1).end(i).sink(arg=KernelInfo(name="uopfunc", opts_to_apply=()))
 
     a = Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
@@ -653,12 +712,12 @@ class TestCallInKernel(unittest.TestCase):
   def test_call_to_copy(self):
     @uopfunc
     def copy(out:UOp, A:UOp):
-      i = UOp.range(out.shape[0], 0, AxisType.LOOP)
+      i = UOp.range(out.shape[0], 0)
       return out[i].store(A[i]).end(i).sink()
 
     def forward(out1:UOp, out2:UOp, A:UOp):
       call = copy(out1, A)
-      i = UOp.range(out2.shape[0], 0, AxisType.LOOP)
+      i = UOp.range(out2.shape[0], 0)
       inline = out2[i].store(A[i]).end(i).sink()
       return UOp.group(call, inline).sink(arg=KernelInfo(name="forward", opts_to_apply=()))
 

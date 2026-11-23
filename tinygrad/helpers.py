@@ -50,6 +50,15 @@ def ansilen(s:str): return len(ansistrip(s))
 def ansipad(s:str, w:int): return s+' '*max(w-ansilen(s), 0)
 def make_tuple(x:int|Sequence[int], cnt:int) -> tuple[int, ...]: return (x,)*cnt if isinstance(x, int) else tuple(x)
 def to_tuple(x:T|tuple[T, ...]) -> tuple[T, ...]: return x if isinstance(x, tuple) else (x,)
+def is_disk_device(device:str|tuple[str, ...]) -> bool: return any(d.split(":", 1)[0].upper() in ("DISK", "NVME") for d in to_tuple(device))
+@functools.cache
+def canonicalize_device_name(device:str) -> str: return re.sub(r":0$", "", (d:=device.split(":", 1)[0].upper()) + device[len(d):])
+def canonicalize_device(device:str|tuple|list|None) -> str|tuple[str, ...]:
+  if device is None:
+    from tinygrad.device import Device  # the default device is selected by opening the devices
+    device = Device.DEFAULT
+  if not isinstance(device, (tuple, list)): return canonicalize_device_name(device)
+  return canonical[0] if len(canonical:=tuple(canonicalize_device_name(d) for d in device)) == 1 else canonical
 def flatten(l:Iterable[Iterable[T]]): return [item for sublist in l for item in sublist]
 def fully_flatten(l):
   if not (hasattr(l, "__len__") and hasattr(l, "__getitem__")) or isinstance(l, str): return [l]
@@ -66,7 +75,7 @@ def strip_parens(fst:str) -> str: return fst[1:-1] if fst[:1]=='(' and fst[-1:]=
 def ceildiv(num, amt):
   # use (num + amt - 1) // amt when num is a UOp and non-negative to avoid C/Python division mismatch
   if hasattr(num, 'vmin') and num.vmin >= 0 and (amt > 0 if isinstance(amt, int) else amt.vmin > 0): return (num + amt - 1) // amt
-  return int(ret) if isinstance((ret:=-(num//-amt)), float) else ret
+  return math.ceil(num / amt) if any(isinstance(x, float) for x in (num, amt)) else -(num//-amt)
 def round_up(num:int, amt:int) -> int: return (num+amt-1)//amt * amt
 def round_down(num:int, amt:int) -> int: return -round_up(-num, amt)
 def next_power2(x): return 1 if x == 0 else 1 << (x - 1).bit_length()
@@ -121,7 +130,6 @@ def canonicalize_strides(shape:tuple[T, ...], strides:tuple[T, ...]) -> tuple[T,
 
 @functools.cache
 def strides_for_shape(shape:tuple[T, ...]) -> tuple[T, ...]:
-  if not shape: return ()
   strides = tuple(itertools.accumulate(reversed(shape[1:]), operator.mul, initial=1))[::-1]
   return canonicalize_strides(shape, strides)
 
@@ -151,7 +159,7 @@ def select_first_inited(candidates:Sequence[Callable[...,T]], err_msg:str, cache
 def pluralize(st:str, cnt:int): return f"{cnt} {st}"+('' if cnt == 1 else 's')
 
 # for length N coefficients `p`, returns p[0] * x**(N-1) + p[1] * x**(N-2) + ... + p[-2] * x + p[-1]
-def polyN(x:T, p:list[float]) -> T: return functools.reduce(lambda acc,c: acc*x+c, p, 0.0)  # type: ignore
+def polyN(x:T, p:list[float]) -> T: return functools.reduce(lambda acc,c: acc*x+c, p)  # type: ignore
 
 @functools.cache
 def to_function_name(s:str): return ''.join([c if c in (string.ascii_letters+string.digits+'_') else f'{ord(c):02X}' for c in ansistrip(s)])
@@ -396,7 +404,7 @@ if getenv("DEBUG_GC"):
 cache_dir: str = os.path.join(getenv("XDG_CACHE_HOME", os.path.expanduser("~/Library/Caches" if OSX else "~/.cache")), "tinygrad")
 CACHEDB: str = getenv("CACHEDB", os.path.abspath(os.path.join(cache_dir, "cache.db")))
 
-VERSION = 24
+VERSION = 25
 _db_connection = threading.local()
 def db_connection():
   if (conn:=getattr(_db_connection, "conn", None)) is None:
@@ -567,7 +575,6 @@ def to_mv(ptr:int, sz:int) -> memoryview: return memoryview((ctypes.c_uint8 * sz
 def mv_address(mv): return ctypes.addressof(ctypes.c_char.from_buffer(mv))
 def to_char_p_p(options: list[bytes], to_type=ctypes.c_char):
   return (ctypes.POINTER(to_type) * len(options))(*[ctypes.cast(ctypes.create_string_buffer(o), ctypes.POINTER(to_type)) for o in options])
-def flat_mv(mv:memoryview): return mv if len(mv) == 0 else mv.cast("B", shape=(mv.nbytes,))
 
 # *** tqdm
 

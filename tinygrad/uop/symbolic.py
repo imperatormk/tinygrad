@@ -22,7 +22,6 @@ def simplify_pow(x:UOp, c:UOp) -> UOp|None:
   return None
 
 def fold_bitcast(root:UOp, c:UOp) -> UOp|None:
-  if c.dtype.itemsize != root.dtype.itemsize: return None
   # the value is mathematical and may not fit: reading it as bits is the emission that pins it to the stated width
   return root.const_like(bitcast(truncate[c.dtype](c.val), c.dtype, root.dtype))
 
@@ -50,17 +49,17 @@ def fold_add_divmod_recombine(x:UOp) -> UOp|None:
   #   q == b//div     -> b*mul              (full recombine)
   #   q == (b//div)%d -> (b%(div*d))*mul    (partial recombine into a wider mod, needs d>0)
   terms = list(x.split_uop(Ops.ADD))
-  for i,u in enumerate(terms):
-    mod, mul = u.pop_const(Ops.MUL)
+  scaled = [t.pop_const(Ops.MUL) for t in terms]
+  for i,(mod,mul) in enumerate(scaled):
     if mod.op is not Ops.MOD or mod.src[1].op is not Ops.CONST: continue
     base, div = mod.src[0], mod.src[1].val
-    for j,v in enumerate(terms):
-      q, scale = v.pop_const(Ops.MUL)
+    for j,(q,scale) in enumerate(scaled):
       if i == j or scale != div*mul: continue
-      rest = [t for k,t in enumerate(terms) if k not in (i,j)]
-      if (b:=_quotient_base(q, base, div)) is not None: return (b*mul).usum(*rest)
-      if q.op is Ops.MOD and q.src[1].op is Ops.CONST and (d:=q.src[1].val) > 0 and (b:=_quotient_base(q.src[0], base, div)) is not None:
-        return ((b % (div*d))*mul).usum(*rest)
+      if (b:=_quotient_base(q, base, div)) is None:
+        if q.op is not Ops.MOD or q.src[1].op is not Ops.CONST or (d:=q.src[1].val) <= 0: continue
+        if (b:=_quotient_base(q.src[0], base, div)) is None: continue
+        b = b % (div*d)
+      return (b*mul).usum(*[t for k,t in enumerate(terms) if k not in (i,j)])
   return None
 
 # Invalid poisons the value: ops move inside the gate so the Invalid reaches the LOAD/STORE and folds there.
@@ -286,7 +285,7 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   # complementary zero branches under the same condition select directly
   (UPat.var("c").where(UPat.var("t"), 0) + UPat.var("c").where(0, UPat.var("f")), lambda c,t,f: c.where(t, f)),
   # ALU/variable min==max -> CONST
-  (UPat({Ops.CMPLT, Ops.CMPEQ, Ops.DIV, Ops.MOD, Ops.PARAM, Ops.SPECIAL}, name="x"),
+  (UPat({Ops.CMPLT, Ops.CMPEQ, Ops.DIV, Ops.MOD, Ops.PARAM, Ops.EXTERN, Ops.SPECIAL}, name="x"),
    lambda x: x.const_like(x.vmin) if x.dtype is not dtypes.void and x.vmin == x.vmax else None),
   (UPat(Ops.RANGE, src=(UPat.cvar().or_casted(),), name="x"), lambda x: x.const_like(x.vmin) if x.vmin == x.vmax else None),
   # max folding
@@ -294,7 +293,8 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   # (a<b).where(c, a+(c-b)) -> max(a+(c-b), c), the shift needs a signed int so the unselected arm can't wrap
   ((UPat.var("a") < UPat.cvar("b")).where(UPat.cvar("c"), UPat.var("y")), lambda a,b,c,y: UOp.maximum(y,c) if (y is a and b.val == c.val) or
    (dtypes.is_int(a.dtype) and not dtypes.is_unsigned(a.dtype) and y is a+(c.val-b.val)) else None),
-  (UPat.maximum(UPat.var("x"), UPat.var("y")), lambda x,y: x if x.vmin >= y.vmax else None),
+  # max(x, y) is x, read at the dtype of the max, when x is never below y
+  (UPat.maximum(UPat.var("x"), UPat.var("y")).named("m"), lambda m,x,y: x.ccast(m.dtype) if x.vmin >= y.vmax else None),
   # TODO: why does this rule break beautiful_mnist?
   #((UPat.var("x")+UPat.var("z")).maximum(UPat.var("y")+UPat.var("z")), lambda x,y,z: x.maximum(y) + z),
   # (x//c1)//c2 -> x//(c1*c2) for c2>0 when c1*c2 fits

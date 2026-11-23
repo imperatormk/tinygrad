@@ -1,6 +1,6 @@
 import unittest, random
 import numpy as np
-from tinygrad import Tensor, Device, nn, GlobalCounters, TinyJit, dtypes, Variable, getenv
+from tinygrad import Tensor, Device, nn, GlobalCounters, TinyJit, dtypes, Variable, function, getenv
 from tinygrad.uop.ops import Ops, UOp, AxisType, graph_rewrite
 from tinygrad.helpers import prod, Context, DEV
 from tinygrad.nn.state import get_parameters, get_state_dict
@@ -8,7 +8,7 @@ from tinygrad.engine.realize import run_linear, lower_and_compile, pm_beam
 from test.helpers import not_support_multi_device, needs_second_gpu, slow, check_schedule, assert_kernel_count, KernelCountException
 from hypothesis import given, strategies as strat, settings
 
-settings.register_profile("my_profile", max_examples=200, deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
+settings.register_profile("my_profile", max_examples=getenv("TEST_MAX_EXAMPLES", 200), deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
 settings.load_profile("my_profile")
 
 def helper_test_shard_op(shps, fxn, atol=1e-6, rtol=1e-3):
@@ -401,6 +401,13 @@ class TestMultiTensor(unittest.TestCase):
     s = Tensor([1.0, 2, 3, 4]).shard((f"{Device.DEFAULT}:0", f"{Device.DEFAULT}:1"), axis=0)
     np.testing.assert_equal((s + Tensor(UOp.const(1.0).cast(dtypes.float))).numpy(), [2, 3, 4, 5])
     np.testing.assert_equal((s + Tensor(UOp.const(1.0).cast(dtypes.float)).reshape((1,)).expand((4,))).numpy(), [2, 3, 4, 5])
+  def test_copy_deviceless_value(self):
+    # a*0 simplifies to a deviceless value
+    a = Tensor([1, 2, 3, 4, 5, 6, 7, 8]).realize()
+    self.assertEqual((a*0).to(devices_2).tolist(), [0]*8)
+    self.assertEqual((a*0+1).shard(devices_2, axis=0).sum().item(), 8)
+    # copied on to one device, it is computed there
+    check_schedule((a*0).to(devices_2).to(d2), 1, filter_sink=False)
 
   def test_add_rank_expand_shard(self):
     # a sharded src keeps its own rank under implicit broadcast, its shard axis right-aligns into the output
@@ -714,6 +721,13 @@ class TestMultiTensor(unittest.TestCase):
       np.testing.assert_allclose(r.numpy(), np.ones(256)+np.ones(256), atol=1e-4, rtol=1e-5)
     assert jf.captured is not None
 
+  def test_precompiled_symbolic_allreduce(self):
+    @function(precompile=True)
+    def f(x:Tensor): return x.sum(0)
+    t = Tensor.ones(4, 4).contiguous().shard(devices_2, axis=0).realize()
+    v = Variable("cols", 1, 4).bind(2)
+    self.assertEqual(f(t[:, :v])[:2].tolist(), [4.0, 4.0])
+
   def test_symbolic_broadcast_copy(self):
     rows = Variable("rows", 1, 4).bind(3)
     out = Tensor.ones(rows, 8).to(devices_2).realize()
@@ -842,6 +856,8 @@ class TestMultiTensor(unittest.TestCase):
     self.assertEqual(t.uop.axis, t2.uop.axis)
     t2.realize()
   def test_full_like_on_shard_axis(self): self.test_full_like_on_shard(0)
+  def test_full_like_on_shard_no_buffer(self):
+    self.assertEqual(Tensor.ones(8, device=devices_2, axis=0).full_like(7, buffer=False).tolist(), [7]*8)
 
   def test_dropout_on_shard(self):
     with Context(TRAINING=1):

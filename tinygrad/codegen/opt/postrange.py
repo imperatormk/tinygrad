@@ -2,12 +2,9 @@ from __future__ import annotations
 import itertools
 from dataclasses import replace
 from typing import cast
-from tinygrad.uop.ops import Ops, GroupOp, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, identity_element
-from tinygrad.uop.ops import axis_colors
-from tinygrad.device import Buffer
+from tinygrad.uop.ops import Ops, GroupOp, UOp, KernelInfo, graph_rewrite, AxisType, ssimplify, identity_element, axis_colors
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, round_up, prod, get_single_element
-from tinygrad.helpers import ALLOW_TF32, count, Context
+from tinygrad.helpers import colored, getenv, DEBUG, NOOPT, round_up, prod, get_single_element, ALLOW_TF32, count, Context
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError, check
 from tinygrad.codegen.simplify import pm_flatten_range
 from tinygrad.renderer import Renderer
@@ -25,7 +22,7 @@ class Scheduler:
   def applied_opts(self) -> tuple[Opt, ...]: return self.ast.arg.applied_opts
   @property
   def rngs(self):
-    # Keep serial/vectorized reduction axes last, deriving their role from REDUCE rather than the axis type.
+    # Keep WEAK/UPCAST reduction axes last, deriving their role from REDUCE rather than the axis type.
     # void RANGEs are loops, not opt axes. the DEVICE axis is launched, not an opt axis
     red = self.reduce_ranges
     return sorted([u for u in self.ast.backward_slice if u.op is Ops.RANGE and u.dtype is not dtypes.void and u.vmax > 0
@@ -50,7 +47,7 @@ class Scheduler:
       name = k_type + colored('_', 'BLACK').join(['']+special_ops+[colored(x.src[0].render(), color) for x,color in zip(self.rngs, self.colors())])
     return self.ast.replace(arg=KernelInfo(name=name, applied_opts=self.applied_opts, optimized=True))
 
-  def convert_loop_to_global(self) -> None:
+  def convert_weak_to_global(self) -> None:
     if not self.ren.has_local: return
     red = self.reduce_ranges
     rngs = [r for s in self.ast.src if s.op is Ops.END for r in s.src[1:] if r.axis_type is AxisType.WEAK and r not in red]
@@ -89,7 +86,7 @@ class Scheduler:
     if opt.op is OptOps.TC: rng = UOp(Ops.NOOP)
     else:
       check(type(opt.axis) is int and 0 <= opt.axis < self.shape_len, f"invalid axis on {opt.axis=} {opt.op=} {self.shape_len=}")
-      rng = self.rngs[cast(int, opt.axis)]
+      rng = self.rngs[opt.axis]
 
     ret = None
     if opt.op is OptOps.SPLIT:
@@ -119,9 +116,10 @@ class Scheduler:
       check(len(self.applied_opts) == 0, "tensor core opts must be first") # TODO: remove the need for this by having warps
       check(opt.axis is not None and opt.axis >= 0, "tensor core opts must have an axis")
       check(opt.arg is not None and isinstance(opt.arg, tuple) and len(opt.arg) == 3, "tensor core opts must have valid arg")
-      check(-1 <= (tc_select:=cast(tuple, opt.arg)[0]) < len(self.ren.tensor_cores), "tensor core opts must have valid tc_select")
-      check(0 <= (tc_opt:=cast(tuple, opt.arg)[1]) <= 2, "tensor core opts must have valid tc_opt")
-      check(0 < (use_tensor_cores:=cast(tuple, opt.arg)[2]) <= 2, "use_tensor_cores value is not valid")
+      tc_select, tc_opt, use_tensor_cores = cast(tuple, opt.arg)
+      check(-1 <= tc_select < len(self.ren.tensor_cores), "tensor core opts must have valid tc_select")
+      check(0 <= tc_opt <= 2, "tensor core opts must have valid tc_opt")
+      check(0 < use_tensor_cores <= 2, "use_tensor_cores value is not valid")
       try: ret = self._apply_tc_opt(use_tensor_cores, cast(int, opt.axis), tc_select, tc_opt)
       except ValueError as e: raise KernelOptError(str(e))
       check(ret is not None, "no tensor core available")
@@ -151,7 +149,7 @@ class Scheduler:
       ret = replaced_rng
     elif opt.op is OptOps.SWAP:
       check(type(opt.arg) is int and 0 <= opt.arg < self.shape_len, f"invalid swap axis on {opt.arg=} {self.shape_len=}")
-      altrng:UOp = self.rngs[cast(int, opt.arg)]
+      altrng:UOp = self.rngs[opt.arg]
       check(rng.axis_type == AxisType.GLOBAL and altrng.axis_type == AxisType.GLOBAL, "swap only for globals")
       self.ast = self.ast.substitute({rng:rng.replace(arg=(rng.axis_type, *altrng.axis_id)),
                                       altrng:altrng.replace(arg=(altrng.axis_type, *rng.axis_id))},
@@ -240,22 +238,17 @@ class Scheduler:
   @property
   def group_for_reduces(self) -> int: return len(self.axes_of(AxisType.WARP, AxisType.LOCAL, reduce=True))
 
-def args_from_ast(ast:UOp, dname:str) -> tuple[list[Buffer], dict[str, int]]:
-  glbls = sorted([x for x in ast.backward_slice if x.op is Ops.PARAM and x.arg.slot >= 0], key=lambda x: x.arg.slot)
-  return [Buffer(dname, x.max_numel() * x.dtype.itemsize) for x in glbls], {k.expr:int(k.vmax+k.vmin)//2 for k in ast.variables()}
-
 def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
   if ast.arg is not None and ast.arg.optimized: return ast
   k = Scheduler(ast, ren)
-  k.convert_loop_to_global()
+  k.convert_weak_to_global()
   if (ki:=k.ast.arg).opts_to_apply is not None:
     for opt in ki.opts_to_apply: k.apply_opt(opt)
   elif beam >= 1:
     from tinygrad.codegen.opt.search import beam_search
-    rawbufs, var_vals = args_from_ast(ast, ren.target.device)
     # beam search may open devices
     with Context(ALLOW_DEVICE_USAGE=1):
-      k = beam_search(k, rawbufs, var_vals, beam, bool(getenv("BEAM_ESTIMATE", 1)))
+      k = beam_search(k, beam, bool(getenv("BEAM_ESTIMATE", 1)))
   elif not NOOPT and ki.applied_opts == ():
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
     # NOTE: hand_coded_optimizations doesn't support multiblock opts yet

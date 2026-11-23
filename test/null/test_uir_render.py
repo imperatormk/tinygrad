@@ -1,21 +1,18 @@
 import unittest, math
-from dataclasses import replace
 from tinygrad import Tensor
 from tinygrad.dtype import dtypes, Invalid
 from tinygrad.uop import Ops
-from tinygrad.uop.ops import UOp, UPat, graph_rewrite, ParamArg, KernelInfo, ProgramInfo
+from tinygrad.uop.ops import UOp, UPat, graph_rewrite, KernelInfo, ProgramInfo
 from tinygrad.uop.movement import mop_cleanup
 from tinygrad.uop.uir import render_uir, parse_uir
 from tinygrad.device import Device
+from tinygrad.tensor import ExportCtx, pm_export
 from tinygrad.codegen import full_rewrite_to_sink, to_program
 from tinygrad.helpers import Context, ansistrip
 from tinygrad.renderer import Estimates
 
 def _strip_buffers(root:UOp) -> UOp:
-  # realized BUFFERs carry runtime state the wire can't; a BUFFER with no binding is exactly an ALLOC
-  subs = {b: b.replace(op=Ops.ALLOC, arg=replace(b.arg, buffer=None, spec=None))
-          for b in root.toposort(enter_calls=True) if b.op is Ops.BUFFER and isinstance(b.arg, ParamArg) and b.arg.buffer is not None}
-  return root.substitute(subs, walk=True, enter_calls=True, name="strip buffers for wire format test") if subs else root
+  return graph_rewrite(root, pm_export, ctx=ExportCtx(), bottom_up=True, enter_calls=True, name="strip buffers for wire format test")
 
 def assert_roundtrip(case, root:UOp):
   # UOps are hash-consed, so a lossless round trip gives back the identical UOp
@@ -50,6 +47,11 @@ class TestSSARender(unittest.TestCase):
     n = UOp.variable("n", 1, 64)
     g = UOp.sink(((n + 1) * 2) % 7, (n % 5) + UOp.const(Invalid))
     assert_roundtrip(self, g)
+
+  def test_buffer_in_call_body(self):
+    b = Tensor.empty(8, device="NULL").realize().uop.buf_uop
+    p = UOp.param(0, b.dtype, 8, "NULL")
+    assert_roundtrip(self, UOp.sink(UOp.sink(p.store(p + b)).call(Tensor.empty(8, device="NULL").realize().uop.buf_uop)))
 
   def test_const_typing(self):
     g = UOp.sink(UOp.const(True), UOp.const(1), UOp.const(-5, dtypes.int32), UOp.const(2.0, dtypes.float32),
@@ -103,13 +105,13 @@ class TestSSARender(unittest.TestCase):
   def test_nan_pattern(self):
     # the pattern compiler puts a UPat's float arg in a PYLITERAL, any nan is the same one
     from tinygrad.uop.upat import _get_clause
-    assert_roundtrip(self, _get_clause(UPat(Ops.CONST, arg=-math.nan), UOp.custom_function("x", fmt=True).call(inline=True)))
+    assert_roundtrip(self, _get_clause(UPat(Ops.CONST, arg=-math.nan), UOp.native("x", fmt=True).call(inline=True)))
 
   def test_amd_instructions(self):
     # rdna3 and rdna4 instructions have the same names, a python object is evaluated in its own module
     from tinygrad.runtime.autogen.amd.rdna3 import ins as rdna3
     from tinygrad.runtime.autogen.amd.rdna4 import ins as rdna4
-    for ins in (rdna3, rdna4): assert_roundtrip(self, UOp(Ops.INS, arg=(ins.v_mov_b32_e32(ins.v[1], 1.0), dtypes.void)))
+    for ins in (rdna3, rdna4): assert_roundtrip(self, UOp.native(ins.v_mov_b32_e32(ins.v[1], 1.0)).call())
 
 class TestParseUIR(unittest.TestCase):
   def test_format(self):
