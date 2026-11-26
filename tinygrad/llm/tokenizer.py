@@ -51,7 +51,7 @@ class SimpleTokenizer:
   def from_gguf_kv(kv:dict):
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L1818-L1820
     normal_tokens, special_tokens = dict[str, int](), dict[str, int]()
-    for idx, (tok, typ) in enumerate(zip(kv["tokenizer.ggml.tokens"], kv["tokenizer.ggml.token_type"])):
+    for idx, (tok, typ) in enumerate(zip(kv["tokenizer.ggml.tokens"], kv["tokenizer.ggml.token_type"], strict=True)):
       (special_tokens if typ in (2, 3, 4) else normal_tokens)[tok] = idx # UNKNOWN|CONTROL|USER_DEFINED
     return SimpleTokenizer(normal_tokens, special_tokens, kv["tokenizer.ggml.pre"],
       bos_id=kv.get('tokenizer.ggml.bos_token_id'), add_bos=kv.get('tokenizer.ggml.add_bos_token', True),
