@@ -1,5 +1,5 @@
 import struct, unittest
-from tinygrad import dtypes, Tensor, Device
+from tinygrad import dtypes, Tensor, Device, Context
 from tinygrad.llm.gguf import ggml_data_to_tensor, gguf_shard, _bulk_load
 supported_dtypes = Device[Device.DEFAULT].renderer.supported_dtypes()
 
@@ -24,6 +24,7 @@ class TestGGUF(unittest.TestCase):
       self.assertEqual(bool(res:=_bulk_load(entries, "CPU")), bulk)
       if bulk: self.assertEqual(len({t.uop.buffer.base for t in res.values()}), len({e[0].uop.base for e in entries.values()}))
       self.assertEqual({k: v.tolist() for k, v in gguf_shard(entries, ("CPU",)).items()}, exp)
+    with Context(MAX_BUFFER_SIZE=16): self.assertEqual(_bulk_load({"a": a, "b": b}, "CPU"), {})
     self.assertEqual(gguf_shard({}, ("CPU",)), {})
 
 if __name__ == '__main__':
