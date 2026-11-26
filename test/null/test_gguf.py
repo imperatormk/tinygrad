@@ -11,13 +11,18 @@ class TestGGUF(unittest.TestCase):
 
   def test_gguf_shard_bulk_load(self):
     vals_a, vals_b, vals_c = [1.0, 2.0, 3.0, 4.0], [10.0, 20.0, 30.0, 40.0], [5.0, 6.0, 7.0, 8.0]
-    raw = Tensor(b"\x00" * 16 + struct.pack("<4f4f", *vals_a, *vals_b) + b"\x00" + struct.pack("<4f", *vals_c), device="CPU").realize()
-    a, b, c, empty = (raw[16:32], (4,), 0), (raw[32:48], (4,), 0), (raw[49:65], (4,), 0), (raw[48:48], (0,), 0)
+    bc = struct.pack("<4f", *vals_c)
+    part0 = Tensor(b"\x00" * 16 + struct.pack("<4f4f", *vals_a, *vals_b) + b"\x00" + bc + b"\x00" * 15 + bc, device="CPU").realize()
+    part1 = Tensor(b"\x00" * 16 + bc, device="CPU").realize()
+    a, b, c = (part0[16:32], (4,), 0), (part0[32:48], (4,), 0), (part0[49:65], (4,), 0)
+    gap, empty, d = (part0[80:96], (4,), 0), (part0[48:48], (0,), 0), (part1[16:32], (4,), 0)
     for entries, exp, bulk in (({"a": a, "b": b}, {"a": vals_a, "b": vals_b}, True),
-                               ({"a": a, "b": b, "c": c}, {"a": vals_a, "b": vals_b, "c": vals_c}, False),
-                               ({"a": a, "c": c}, {"a": vals_a, "c": vals_c}, False),
+                               ({"a": a, "b": b, "d": d}, {"a": vals_a, "b": vals_b, "d": vals_c}, True),
+                               ({"a": a, "b": b, "c": c, "d": d}, {"a": vals_a, "b": vals_b, "c": vals_c, "d": vals_c}, False),
+                               ({"a": a, "gap": gap}, {"a": vals_a, "gap": vals_c}, False),
                                ({"a": a, "b": b, "e": empty}, {"a": vals_a, "b": vals_b, "e": []}, False)):
-      self.assertEqual(bool(_bulk_load(entries, "CPU")), bulk)
+      self.assertEqual(bool(res:=_bulk_load(entries, "CPU")), bulk)
+      if bulk: self.assertEqual(len({t.uop.buffer.base for t in res.values()}), len({e[0].uop.base for e in entries.values()}))
       self.assertEqual({k: v.tolist() for k, v in gguf_shard(entries, ("CPU",)).items()}, exp)
     self.assertEqual(gguf_shard({}, ("CPU",)), {})
 

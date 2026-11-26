@@ -41,7 +41,7 @@ class SimpleTokenizer:
     self._split_to_word = re.compile(f"({r_w}|{r_n}|{r_p}|{r_t})")
     self._split_to_sentence = re.compile("|".join(re.escape(tok) for tok in special_tokens.keys()) if special_tokens else r"(?!)")
 
-    self._normal_tokens = {tok.translate(trans).encode('latin1'): tid for tok, tid in normal_tokens.items()}
+    self._normal_tokens = {(tok if tok.isascii() else tok.translate(trans)).encode('latin1'): tid for tok, tid in normal_tokens.items()}
     self._special_tokens = special_tokens
     self._tok2bytes = dict(zip(self._normal_tokens.values(), self._normal_tokens.keys())) | {tid: tok.encode() for tok, tid in special_tokens.items()}
     self.preset, self.chat_template = preset, chat_template
