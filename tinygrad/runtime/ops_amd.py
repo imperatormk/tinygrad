@@ -548,6 +548,7 @@ def amd_build_program(prg:UOp, devs:tuple[str, ...]) -> tuple[AMDProgramData, UO
   data, image = _amd_program_image(devs[0], prg.src[3].arg)
   return data, patch(make_program(prg, len(image), devs[0]), [], image)
 
+@functools.lru_cache(maxsize=1024)
 def _amd_program_image(dev:str, lib:bytes) -> tuple[AMDProgramData, bytes]:
   image, sections, relocs = elf_loader(lib)
   rodata = next(sh.header.sh_addr for sh in sections if sh.name == ".rodata")

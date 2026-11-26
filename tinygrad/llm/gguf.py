@@ -4,7 +4,7 @@ from typing import Any, Callable
 from tinygrad.tensor import Tensor
 from tinygrad.device import Device
 from tinygrad.dtype import dtypes
-from tinygrad.helpers import prod, round_up
+from tinygrad.helpers import prod, round_up, MAX_BUFFER_SIZE, all_int
 from tinygrad.nn.state import TensorIO
 from tinygrad.uop.ops import Ops, UOp
 
@@ -184,15 +184,16 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       return d * (bits * 2 - 1)
   raise ValueError(f"GGML type '{ggml_type}' is not supported!")
 
-def _read_unpack(fmt: str, n: int, r:io.BufferedIOBase): return struct.unpack(fmt, r.read(n))[0]
-def read_str(r:io.BufferedIOBase): return str(r.read(read_uint64(r)), "utf-8")
+_SCALAR_STRUCTS = {t: struct.Struct("<"+f) for t, f in {0:"c", 1:"b", 2:"H", 3:"h", 4:"I", 5:"i", 6:"f", 7:"?", 10:"Q", 11:"q", 12:"d"}.items()}
+def _read_unpack(s:struct.Struct, r:io.BufferedIOBase): return s.unpack(r.read(s.size))[0]
+def read_str(r:io.BufferedIOBase): return r.read(read_uint64(r)).decode("utf-8")
 def read_arr(r:io.BufferedIOBase):
-  item_reader, n = readers[read_int32(r)], read_uint64(r)
-  return [item_reader(r) for _ in range(n)]
+  t, n = read_int32(r), read_uint64(r)
+  if (s:=_SCALAR_STRUCTS.get(t)) is not None: return list(struct.unpack(f"<{n}{s.format[1:]}", r.read(n * s.size)))
+  return [readers[t](r) for _ in range(n)]
 
 readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_arr,
-  **{ t: functools.partial(_read_unpack, "<"+f, nb) for t,f,nb in \
-    [ (0,"c",1), (1,"b",1), (2,"H",2), (3,"h",2), (4,"I",4), (5,"i",4), (6,"f",4), (7,"?",1), (10,"Q",8), (11,"q",8), (12,"d",8) ] } }
+  **{ t: functools.partial(_read_unpack, s) for t, s in _SCALAR_STRUCTS.items() } }
 read_uint32, read_int32, read_uint64, read_int64 = readers[4], readers[5], readers[10], readers[11]
 
 def gguf_parse(fn: Tensor|str|pathlib.Path) -> tuple[dict, dict[str, tuple[Tensor, tuple[int, ...], int]]]:
@@ -263,6 +264,19 @@ class GGUFPackedTable:
   def read(self, start:int|UOp, n:int, device:str|tuple[str, ...]|None) -> Tensor:
     return ggml_data_to_tensor(self.rows[start:start+n].to(device).flatten(), n*int(self.rows.shape[1])*self.width, self.typ)
 
+def _bulk_load(entries:dict[str, tuple[Tensor, tuple[int, ...], int]], dev:str) -> dict[str, Tensor]:
+  if not entries or dev.startswith(("CL", "WEBGPU")): return {}
+  base = next(iter(entries.values()))[0].uop.base
+  if base.op is not Ops.BUFFER or base.dtype != dtypes.uint8: return {}
+  spans = {k: (m[0], m[1]) for k, (d, _, _) in entries.items()
+           if (u:=d.uop).op is Ops.SHRINK and len(u.shape) == 1 and u.src[0] is base and all_int(m:=u.marg[0])}
+  if len(spans) != len(entries): return {}
+  lo, hi = min(o for o, _ in spans.values()), max(o + sz for o, sz in spans.values())
+  if not (0 < hi - lo <= sum(sz for _, sz in spans.values()) * 1.05) or hi - lo > MAX_BUFFER_SIZE > 0 \
+     or any(sz <= 0 or (o - lo) % 8 != 0 for o, sz in spans.values()): return {}
+  buf = Tensor(base)[lo:hi].to(dev).realize()._buffer()
+  return {k: Tensor(UOp.from_buffer(buf.view(sz, o - lo), dtypes.uint8)) for k, (o, sz) in spans.items()}
+
 def gguf_shard(entries:dict[str, tuple[Tensor, tuple[int, ...], int]], devices:tuple[str, ...],
                shard_map:dict[str, int]|None=None, repeats:dict[str, int]|None=None) -> dict[str, Tensor]:
   """
@@ -274,6 +288,9 @@ def gguf_shard(entries:dict[str, tuple[Tensor, tuple[int, ...], int]], devices:t
     data, shape, typ = entries[name]
     if n % r or shape[0] % (n//r): raise ValueError(f"{name}: can't repeat {shape} {r} times over {n} devices")
     entries[name] = (data.to("CPU").reshape(n//r, -1).repeat_interleave(r, 0).flatten(), (shape[0]*r, *shape[1:]), typ)
+  if n == 1 and not shard_map and (packed:=_bulk_load(entries, devices[0])):
+    Device[devices[0]].allocator.free_cache()
+    return {name: ggml_data_to_tensor(packed[name], prod(shape), typ).reshape(shape) for name, (_, shape, typ) in entries.items()}
   for name, (data, shape, typ) in entries.items():
     if (axis:=shard_map.get(name)) is None: packed[name] = data.shard(devices)
     else:
@@ -282,7 +299,9 @@ def gguf_shard(entries:dict[str, tuple[Tensor, tuple[int, ...], int]], devices:t
       parts = (data.to("CPU") if prod(shape[:axis]) > 1 else data).reshape(*shape[:axis], n, -1)
       packed[name] = parts.permute(axis, *range(axis), axis+1).shard(devices, 0)
   # TODO: shard copies the full tensor to every device
-  for t in packed.values(): t.realize()
+  if n == 1 and packed: Tensor.realize(*packed.values())
+  else:
+    for t in packed.values(): t.realize()
   for d in devices: Device[d].allocator.free_cache()
   def decode(name:str, shape:tuple[int, ...], typ:int) -> Tensor:
     decoded = ggml_data_to_tensor(packed[name].flatten(), prod(shape), typ)

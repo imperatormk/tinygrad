@@ -72,6 +72,7 @@ def resolve(x:UOp|bool, default:bool=True):
   if isinstance(x, bool): return x
   assert x.dtype == dtypes.bool, "UOp in resolve must be bool"
   # NOTE: generating the text for the exception is expensive, so we do this
+  if x.vmin == x.vmax: return bool(x.vmin)
   return bool(sx.vmin) if (sx:=x.simplify()).vmin == sx.vmax else default
 
 # smax/smin are replacements for max/min that preserve symbolic
@@ -200,20 +201,20 @@ class UOpMetaClass(type):
 
 # recursive_property replaces functools.cached_property in recursive UOp functions to prevent RecursionError
 class recursive_property:
-  def __init__(self, fxn):
-    self.fxn = fxn
-    self.nm = fxn.__name__
-    self.__doc__ = fxn.__doc__
+  def __init__(self, fxn=None, stop:Ops|None=None, first:Ops|None=None):
+    self.fxn, self.nm, self.stop, self.first, self.__doc__ = fxn, fxn.__name__ if fxn else "", stop, first, fxn.__doc__ if fxn else None
+  def __call__(self, fxn:Callable): return recursive_property(fxn, self.stop, self.first)
   def __get__(self, x:UOp|None, owner=None):
     if x is None: return self
     # NOTE: this is a non-data descriptor, so it's only called if the value isn't in x.__dict__
     # compute it in post order (srcs left to right) for x and all the srcs that don't have it yet
-    nm, stack = self.nm, [x]
+    nm, fxn, stop, first, stack = self.nm, self.fxn, self.stop, self.first, [x]
     while stack:
       if nm in (d:=(node:=stack[-1]).__dict__): stack.pop()
-      elif missing:=[s for s in node.src if nm not in s.__dict__]: stack.extend(reversed(missing))
+      elif missing:=[s for s in (() if node.op is stop else node.src[:1] if node.op is first else node.src) if nm not in s.__dict__]:
+        stack.extend(reversed(missing))
       else:
-        d[nm] = self.fxn(node)
+        d[nm] = fxn(node)
         stack.pop()
     return x.__dict__[nm]
 
@@ -233,7 +234,7 @@ class UOp(Mixin, metaclass=UOpMetaClass):
   op:Ops
   src:tuple[UOp, ...] = tuple()
   arg:Any = None
-  @recursive_property
+  @recursive_property(stop=Ops.PROGRAM, first=Ops.AFTER)
   def dtype(self) -> DType: return dtype_from_uop(self.op, self.src, self.arg)
   def __del__(self):
     # NOTE: getattr because this object may be partially constructed (e.g. if __init__ raised, like the BEAM timeout SIGALRM)
@@ -315,7 +316,7 @@ class UOp(Mixin, metaclass=UOpMetaClass):
 
   # *** uop shape stuff ***
 
-  @recursive_property
+  @recursive_property(stop=Ops.PROGRAM, first=Ops.AFTER)
   def _shape(self) -> tuple[sint, ...]|None:
     # elementwise ops are the most common, they are first
     if self.op in GroupOp.UnaryElementwise:
@@ -447,8 +448,9 @@ class UOp(Mixin, metaclass=UOpMetaClass):
     return ()
 
   # determine what ranges this is in
-  @recursive_property
+  @recursive_property(stop=Ops.PROGRAM)
   def _ranges(self) -> dict[UOp, None]:
+    if self.op is Ops.PROGRAM: return {}
     ret: dict[UOp, None] = {}
     for s in self.src: ret.update(s.ranges)
     # an ended RANGE ends itself, anything else ends the ranges it carries (same as not flowing through it, pre pm_add_control_flow)
@@ -474,8 +476,8 @@ class UOp(Mixin, metaclass=UOpMetaClass):
   # *** uop evaluation ***
 
   def simplify(self):
-    if self.op is Ops.CONST: return self
-    if self.op is Ops.SINK and all(s.op is Ops.CONST or (s.op is Ops.STACK and all(x.op is Ops.CONST for x in s.src)) for s in self.src): return self
+    if self.op is Ops.CONST or (self.op is Ops.PARAM and (self.is_template or self.vmin != self.vmax)): return self
+    if self.op is Ops.CAST and self.src[0].op is Ops.CONST and self.dtype in dtypes.all: return self.const_like(self.src[0].val)
     # late import!
     from tinygrad.uop.symbolic import symbolic
     with Context(TRACK_MATCH_STATS=0):
@@ -591,6 +593,7 @@ class UOp(Mixin, metaclass=UOpMetaClass):
   def alu(self, op, *src:UOp, **kwargs): return UOp(op, src=(self, *src), **kwargs)
   @staticmethod
   def const(b:ConstLike, dtype:DType|None=None):
+    if type(b) is int and (dtype is None or dtype is dtypes.weakint): return UOp(Ops.CONST, (), b)
     if isinstance(b, UOp): return b if dtype is None else b.cast(dtype)
     if dtype is None or b is Invalid: dtype = dtypes.from_py(b)
     # NOTE: it always has to be STACK now, even if they are all the same
@@ -777,8 +780,9 @@ class UOp(Mixin, metaclass=UOpMetaClass):
         dtype = dtype_from_uop(Ops.STACK, srcs, None)
         return UOp(Ops.STACK, src=tuple(u if u.base.is_invalid else u.ccast(dtype) for u in srcs))
       case _: raise RuntimeError(f"{op} is not a MovementOp")
-    usrcs = [shape_to_shape_arg(arg) for arg in src_args]
-    ret = UOp(op, src=(self,)+UOp.sink(*usrcs).simplify().src)
+    usrcs = tuple(shape_to_shape_arg(a) for a in src_args)
+    if not all(all_int(a) for a in src_args): usrcs = UOp.sink(*usrcs).simplify().src
+    ret = UOp(op, src=(self,)+usrcs)
     return self if op is not Ops.PERMUTE and ret.shape == self.shape and (op in {Ops.RESHAPE, Ops.EXPAND} or all(o == 0 for o,_ in ret.marg)) else ret
 
   # *** uop Buffer stuff ***
@@ -837,8 +841,9 @@ class UOp(Mixin, metaclass=UOpMetaClass):
     ret = self.empty_like(device=device)
     src = self if self.device is None or self.device == device else self.copy_to_device(device)
     return ret.after(ret.store(src.cast(ret.dtype)))
-  @recursive_property
+  @recursive_property(stop=Ops.PROGRAM, first=Ops.AFTER)
   def device(self) -> str|tuple[str, ...]|None:
+    if self.op is Ops.PROGRAM: return None
     if self.op is Ops.PARAM: return self.arg.device
     if self.op is Ops.STAGE: return self.src[0].device if self.arg is None else self.arg.device
     if self.op is Ops.AFTER: return self.src[0].device
@@ -858,7 +863,7 @@ class UOp(Mixin, metaclass=UOpMetaClass):
     # NOTE: no device means no place to store, weak means no width to store. neither can back a buffer as-is
     # TODO: unify with has_buffer_identity
     return self.device is None or self.dtype in dtypes.weaks
-  @recursive_property
+  @recursive_property(stop=Ops.PROGRAM, first=Ops.AFTER)
   def addrspace(self) -> AddrSpace|None:
     # anything that has dtype void has no memory backing, it lives in the ALU
     if self.dtype is dtypes.void: return AddrSpace.ALU
