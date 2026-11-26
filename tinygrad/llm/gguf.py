@@ -185,11 +185,13 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   raise ValueError(f"GGML type '{ggml_type}' is not supported!")
 
 _SCALAR_STRUCTS = {t: struct.Struct("<"+f) for t, f in {0:"c", 1:"b", 2:"H", 3:"h", 4:"I", 5:"i", 6:"f", 7:"?", 10:"Q", 11:"q", 12:"d"}.items()}
+_unpack_u64 = _SCALAR_STRUCTS[10].unpack
 def _read_unpack(s:struct.Struct, r:io.BufferedIOBase): return s.unpack(r.read(s.size))[0]
-def read_str(r:io.BufferedIOBase): return r.read(read_uint64(r)).decode("utf-8")
+def read_str(r:io.BufferedIOBase): return r.read(_unpack_u64(r.read(8))[0]).decode("utf-8")
 def read_arr(r:io.BufferedIOBase):
   t, n = read_int32(r), read_uint64(r)
   if (s:=_SCALAR_STRUCTS.get(t)) is not None: return list(struct.unpack(f"<{n}{s.format[1:]}", r.read(n * s.size)))
+  if t == 8: return [r.read(_unpack_u64(r.read(8))[0]).decode("utf-8") for _ in range(n)]
   return [readers[t](r) for _ in range(n)]
 
 readers: dict[int, Callable[[io.BufferedIOBase], Any]] = { 8: read_str, 9: read_arr,
@@ -266,16 +268,18 @@ class GGUFPackedTable:
 
 def _bulk_load(entries:dict[str, tuple[Tensor, tuple[int, ...], int]], dev:str) -> dict[str, Tensor]:
   if not entries or (dev:=Device.canonicalize(dev)).startswith(("CL", "WEBGPU", "DSP")): return {}
-  base = next(iter(entries.values()))[0].uop.base
-  if base.op is not Ops.BUFFER or base.dtype != dtypes.uint8 or not isinstance(base_buf:=base.realized, Buffer): return {}
-  spans = {k: (m[0], m[1]) for k, (d, _, _) in entries.items()
-           if (u:=d.uop).op is Ops.SHRINK and len(u.shape) == 1 and u.src[0] is base and all_int(m:=u.marg[0])}
-  if len(spans) != len(entries): return {}
-  lo, hi = min(o for o, _ in spans.values()), max(o + sz for o, sz in spans.values())
-  if not (0 < hi - lo <= sum(sz for _, sz in spans.values()) * 1.05) or hi - lo > MAX_BUFFER_SIZE > 0 \
-     or any(sz <= 0 or (o - lo if base.device != dev else base_buf.offset + o) % 16 != 0 for o, sz in spans.values()): return {}
-  buf = Tensor(base)[lo:hi].to(dev)._buffer()
-  return {k: Tensor(UOp.from_buffer(buf.view(sz, o - lo), dtypes.uint8)) for k, (o, sz) in spans.items()}
+  groups: dict[UOp, list[tuple[str, int, int]]] = {}  # group by source buffer (multi-part splits)
+  for k, (d, _, _) in entries.items():
+    if (u:=d.uop).op is not Ops.SHRINK or len(u.shape) != 1 or not all_int(m:=u.marg[0]): return {}
+    groups.setdefault(u.src[0], []).append((k, m[0], m[1]))
+  bounds: dict[UOp, tuple[int, int]] = {}
+  for base, spans in groups.items():
+    if base.op is not Ops.BUFFER or base.dtype != dtypes.uint8 or not isinstance(base_buf:=base.realized, Buffer): return {}
+    lo, hi = bounds[base] = min(o for _, o, _ in spans), max(o + sz for _, o, sz in spans)
+    if not (0 < hi - lo <= sum(sz for _, _, sz in spans) * 1.05) or hi - lo > MAX_BUFFER_SIZE > 0 \
+       or any(sz <= 0 or (o - lo if base.device != dev else base_buf.offset + o) % 16 != 0 for _, o, sz in spans): return {}
+  return {k: Tensor(UOp.from_buffer(buf.view(sz, o - lo), dtypes.uint8))
+          for base, (lo, hi) in bounds.items() for buf in (Tensor(base)[lo:hi].to(dev)._buffer(),) for k, o, sz in groups[base]}
 
 def gguf_shard(entries:dict[str, tuple[Tensor, tuple[int, ...], int]], devices:tuple[str, ...],
                shard_map:dict[str, int]|None=None, repeats:dict[str, int]|None=None) -> dict[str, Tensor]:
