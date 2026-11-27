@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Callable, Generator, cast
-import subprocess, pathlib, struct
+import subprocess, pathlib, signal, struct
 from dataclasses import dataclass, replace
 from tinygrad.helpers import prod, Target, EMULATED_DTYPES, CCACHE, getenv, diskcache_get, diskcache_put, unwrap, round_up
 from tinygrad.uop.ops import Ops, UOp, sint, ssimplify, smin, GroupOp, PatternMatcher
@@ -21,10 +21,16 @@ class Compiler:
   def disassemble(self, lib:bytes): pass
   def server(self, cmd:str, arch:str, *args) -> subprocess.Popen:
     argv = f"{cmd} {pathlib.Path(__file__).parent.parent}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}"
-    return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
+    return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
   def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
-    unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
-    if (lib:=unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])): return lib
+    # BEAM's SIGALRM timeout landing mid-RPC would leave this reply in the pipe for the next compile
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    try:
+      unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
+      unwrap(proc.stdin).flush()
+      lib = unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])
+    finally: signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+    if lib: return lib
     raise CompileError("Compilation Error")
 
 

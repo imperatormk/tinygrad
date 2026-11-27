@@ -3,6 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 import numpy as np
 from examples.openpilot.load_pickle import make_inputs
+from tinygrad import Device
 from tinygrad.helpers import Context, DEV, fetch, getenv
 from tinygrad.engine.realize import lower_and_compile
 from tinygrad.uop.ops import Ops
@@ -80,7 +81,7 @@ class TestCompiledModel(unittest.TestCase):
                                     for k, v in inputs.items() if k in input_types})
       self.model(**inputs)
       for expected, actual in zip(reference, inputs['output_buffers'].values(), strict=True):
-        fp16 = expected.dtype == np.float16
+        fp16 = Device.DEFAULT == "QCOM" and expected.dtype == np.float16
         np.testing.assert_allclose(actual.numpy(), expected, rtol=2e-3 if fp16 else 1e-4,
                                    atol=5e-5 * float(np.abs(expected).max()) if fp16 else 1e-4)
 

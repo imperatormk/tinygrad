@@ -16,10 +16,10 @@ drivers = [cls() for t in DEV.value if (cls:={"MOCKPCI+AMD": AMDriver, "MOCKKFD+
                                               "MOCK+NV": NVDriver, "MOCK+QCOM": QCOMDriver}.get(f"{t.interface}+{t.device}"))]
 tracked_fds: dict[int, typing.Any] = {}
 
-def mock_callback(fn):
-  @ctypes.CFUNCTYPE(None, ctypes.c_uint64)
-  def callback(addr):
-    try: fn(addr)
+def mock_callback(fn, cfunctype=ctypes.CFUNCTYPE(None, ctypes.c_uint64)):
+  @cfunctype
+  def callback(*args):
+    try: return fn(*args)
     except BaseException:
       # ctypes cannot propagate exceptions to the compiled submit/wait loop. Don't leave it waiting on a failed queue.
       try:
@@ -34,9 +34,9 @@ def mockgpu_doorbell(addr:int): # compiled stores aren't tracked, so the submits
     if st <= addr < en: wcb(None, addr - st)
 setattr(libc.dll, "mockgpu_doorbell", mockgpu_doorbell)
 
-@ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint64)
-def mockgpu_ioctl(fd:int, req:int, argp:int) -> int: # compiled submits call ioctl directly, bypassing MockFileIOInterface
-  return tracked_fds[fd].ioctl(fd, req, argp)
+def _ioctl(fd:int, req:int, argp:int) -> int: return tracked_fds[fd].ioctl(fd, req, argp)
+# compiled submits call ioctl directly, bypassing MockFileIOInterface
+mockgpu_ioctl = mock_callback(_ioctl, ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint64))
 setattr(libc.dll, "mockgpu_ioctl", mockgpu_ioctl)
 
 mocked = {t.device for t in DEV.value if t.interface.startswith("MOCK")}
