@@ -1,4 +1,4 @@
-import functools, hashlib, itertools, math, pathlib, sys
+import functools, hashlib, itertools, math, pathlib
 from dataclasses import dataclass
 from typing import Callable
 import numpy as np
@@ -748,15 +748,14 @@ def _build_vm() -> tuple[TinyELF, list[int]]:
 
   with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", TRANSCENDENTAL=1, CAPTURE_PROCESS_REPLAY=0):
     prg = to_program(UOp.sink(wg_done, arg=KernelInfo(name="qcom_a630_vm")), Device["CPU"].renderer)
-  return TinyELF.from_program(prg), [p.arg.slot for p in prg.kernel_params]
+  # not TinyELF.from_program: its profile key hashes the whole VM graph, which recurses past hypothesis' limit and takes longer than the build
+  sig = tuple((p.arg.name, p.arg.addrspace, p.dtype, p._shape) for p in prg.kernel_params)
+  return TinyELF(prg.src[3].arg, prg.src[0].arg.function_name, prg.arg.target, sig), [p.arg.slot for p in prg.kernel_params]
 
 @functools.cache
 def vm_kernel() -> Callable[..., None]:
   if (vm:=diskcache_get("qcom_a630_vm", key:=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest())) is None:
-    limit = sys.getrecursionlimit()
-    sys.setrecursionlimit(10000) # hypothesis lowers it inside a test, and hashing the VM graph recurses deeper than that
-    try: diskcache_put("qcom_a630_vm", key, vm:=_build_vm())
-    finally: sys.setrecursionlimit(limit)
+    diskcache_put("qcom_a630_vm", key, vm:=_build_vm())
   obj, slots = vm
   rt = Device["CPU"].runtime(obj, links={})
   return lambda *bufs: rt(*[bufs[s] for s in slots])
