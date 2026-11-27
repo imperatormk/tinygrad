@@ -84,8 +84,7 @@ class Cat2(Inst):
   def __init__(self, pc:int, word:int):
     super().__init__(pc, word)
     if self.op not in ALU_OPS or (self.op in CMPS and self.cond >= 6): raise self.error()
-    if self.ei and (self.op != mesa.OPC_ADD_U or not self.full): raise self.error()
-    if self.sat and self.op not in CMPS and self.op not in SAT_INT and self.op not in FLOAT_OPS: raise self.error()
+    if self.ei or (self.sat and self.op not in CMPS and self.op not in FLOAT_OPS): raise self.error()
     self.dst_half = (not self.full) ^ bool(self.dst_conv)
     self.srcs = [multisrc(getbits(word, 0, 15), not self.full, self.src1_r)]
     if self.op not in CAT2_1SRC: self.srcs.append(multisrc(getbits(word, 16, 31), not self.full, self.src2_r))
@@ -168,10 +167,8 @@ class Cat7(Inst):
 
 CMPS = {mesa.OPC_CMPS_F, mesa.OPC_CMPS_U, mesa.OPC_CMPS_S, mesa.OPC_CMPV_F, mesa.OPC_CMPV_U, mesa.OPC_CMPV_S}
 CMPV = {mesa.OPC_CMPV_F, mesa.OPC_CMPV_U, mesa.OPC_CMPV_S}
-CAT2_1SRC = {mesa.OPC_SIGN_F, mesa.OPC_ABSNEG_F, mesa.OPC_FLOOR_F, mesa.OPC_TRUNC_F, mesa.OPC_ABSNEG_S, mesa.OPC_NOT_B, mesa.OPC_CLZ_B,
-             mesa.OPC_CLZ_S, mesa.OPC_SETRM}
+CAT2_1SRC = {mesa.OPC_SIGN_F, mesa.OPC_ABSNEG_F, mesa.OPC_FLOOR_F, mesa.OPC_TRUNC_F, mesa.OPC_ABSNEG_S, mesa.OPC_NOT_B, mesa.OPC_CLZ_B}
 BITWISE = {mesa.OPC_AND_B, mesa.OPC_OR_B, mesa.OPC_XOR_B, mesa.OPC_NOT_B}
-SAT_INT = {mesa.OPC_ADD_U, mesa.OPC_ADD_S, mesa.OPC_SUB_U, mesa.OPC_SUB_S}
 CAT3_HALF = {mesa.OPC_MAD_F16, mesa.OPC_SEL_B16, mesa.OPC_SEL_S16}
 CATS = {0: Cat0, 1: Cat1, 2: Cat2, 3: Cat3, 4: Cat4, 5: Cat5, 7: Cat7}
 CAT6 = {mesa.OPC_LDG: Ldg, mesa.OPC_STG: Stg, mesa.OPC_LDL: Load, mesa.OPC_LDP: Load, mesa.OPC_STL: Store, mesa.OPC_STP: Store}
@@ -190,12 +187,12 @@ SRC_KIND = {"r": 1, "c": 2, "c<": 3, "i": 4}
 ERR_MSGS = {2: "relative const out of range", 3: "out of bounds local access", 4: "out of bounds private access",
             5: "texture is not bound", 6: "IBO is not bound", 7: "call stack overflow", 8: "ret without call"}
 FMAD_OPS = {mesa.OPC_MAD_F32, mesa.OPC_MAD_F16, mesa.OPC_ADD_F, mesa.OPC_MUL_F}
-SIGNED_IOPS = {mesa.OPC_ADD_S, mesa.OPC_SUB_S, mesa.OPC_MIN_S, mesa.OPC_MAX_S, mesa.OPC_ABSNEG_S, mesa.OPC_CLZ_S,
+SIGNED_IOPS = {mesa.OPC_ADD_S, mesa.OPC_SUB_S, mesa.OPC_MIN_S, mesa.OPC_MAX_S, mesa.OPC_ABSNEG_S,
                mesa.OPC_ASHR_B, mesa.OPC_SEL_S32, mesa.OPC_SEL_S16, mesa.OPC_SAD_S32, mesa.OPC_CMPS_S, mesa.OPC_CMPV_S}
 def _idx(groups:tuple[tuple[int, ...], ...]) -> dict[int, int]: return {op: i for i, g in enumerate(groups) for op in g}
 FMISC_IDX = _idx(((mesa.OPC_MIN_F,), (mesa.OPC_MAX_F,), (mesa.OPC_SIGN_F,), (mesa.OPC_ABSNEG_F,), (mesa.OPC_FLOOR_F,),
                   (mesa.OPC_TRUNC_F,), (mesa.OPC_SEL_F32,), (mesa.OPC_CMPS_F, mesa.OPC_CMPV_F)))
-# K_IALU32 runs the ops before MIN_U, K_IMISC runs all of them (with sat/ei/half and the add/sub before AND_B saturating)
+# K_IALU32 runs the 32-bit ops before MIN_U without absneg, K_IMISC runs all of them
 INT_IDX = _idx((
   (mesa.OPC_ADD_U,), (mesa.OPC_ADD_S,), (mesa.OPC_SUB_U,), (mesa.OPC_SUB_S,),
   (mesa.OPC_AND_B,), (mesa.OPC_OR_B,), (mesa.OPC_XOR_B,), (mesa.OPC_NOT_B,),
@@ -205,15 +202,14 @@ INT_IDX = _idx((
   (mesa.OPC_SEL_B32, mesa.OPC_SEL_B16), (mesa.OPC_SEL_S32, mesa.OPC_SEL_S16),
   (mesa.OPC_SHRM,), (mesa.OPC_SHRG,), (mesa.OPC_SHLG,), (mesa.OPC_SHLM,), (mesa.OPC_ANDG,),
   (mesa.OPC_MIN_U,), (mesa.OPC_MIN_S,), (mesa.OPC_MAX_U,), (mesa.OPC_MAX_S,), (mesa.OPC_ABSNEG_S,),
-  (mesa.OPC_CLZ_B,), (mesa.OPC_CLZ_S,), (mesa.OPC_SETRM,), (mesa.OPC_SAD_S32,),
+  (mesa.OPC_CLZ_B,), (mesa.OPC_SAD_S32,),
   (mesa.OPC_CMPS_U, mesa.OPC_CMPV_U), (mesa.OPC_CMPS_S, mesa.OPC_CMPV_S)))
-SFU_IDX = _idx(((mesa.OPC_RCP,), (mesa.OPC_RSQ, mesa.OPC_HRSQ), (mesa.OPC_LOG2, mesa.OPC_HLOG2),
-                (mesa.OPC_EXP2, mesa.OPC_HEXP2), (mesa.OPC_SIN,), (mesa.OPC_SQRT,)))
+SFU_IDX = _idx(((mesa.OPC_RCP,), (mesa.OPC_RSQ,), (mesa.OPC_LOG2,), (mesa.OPC_EXP2,), (mesa.OPC_SIN,), (mesa.OPC_SQRT,)))
 MEM_IDX = _idx(((mesa.OPC_LDG,), (mesa.OPC_STG,), (mesa.OPC_LDL,), (mesa.OPC_STL,), (mesa.OPC_LDP,), (mesa.OPC_STP,)))
 CTRL_IDX = _idx(((mesa.OPC_NOP, mesa.OPC_PREDE, mesa.OPC_FENCE), (mesa.OPC_END,), (mesa.OPC_JUMP,), (mesa.OPC_BR,), (mesa.OPC_BRAO,),
                  (mesa.OPC_BRAA,), (mesa.OPC_PREDT,), (mesa.OPC_PREDF,), (mesa.OPC_CALL,), (mesa.OPC_RET,), (mesa.OPC_BAR,)))
 FLOAT_OPS, ALU_OPS = FMAD_OPS | FMISC_IDX.keys(), FMAD_OPS | FMISC_IDX.keys() | INT_IDX.keys()
-N_ADDSUB, N_IALU32 = INT_IDX[mesa.OPC_AND_B], INT_IDX[mesa.OPC_MIN_U]
+N_IALU32 = INT_IDX[mesa.OPC_MIN_U]
 
 def _rec(*xs:int) -> tuple[int, ...]: return xs + (0,) * (REC_LEN - len(xs))
 def pack_src(s:Src) -> tuple[int, int]:
@@ -240,13 +236,13 @@ def encode_inst(i:Inst, pred_targets:dict[int, int]) -> tuple[int, ...]:
       srcs = [i.srcs[0], Src("i", 0x3C00 if src_half else 0x3F800000, src_half), i.srcs[1]] if i.op == mesa.OPC_ADD_F else \
              [i.srcs[0], i.srcs[1], Src("i", 0x8000 if src_half else 0x80000000, src_half)] if i.op == mesa.OPC_MUL_F else i.srcs
       return _rec(K_FMAD16 if src_half else K_FMAD32, 0, i.dst, i.iterations, int(i.dst_half) | (int(i.sat) << 1), *_pack3(srcs))
-    is_bw, ei = i.op in BITWISE, i.ei if isinstance(i, Cat2) else 0
+    is_bw = i.op in BITWISE
     cond = i.cond if isinstance(i, Cat2) and i.op in CMPS else 0
-    flags = int(i.dst_half) | (int(i.sat) << 1) | (int(i.op in CMPV) << 2) | (int(ei) << 3) | (cond << 4) | \
+    flags = int(i.dst_half) | (int(i.sat) << 1) | (int(i.op in CMPV) << 2) | (cond << 4) | \
             (int(is_bw) << 8) | (int(src_half) << 9) | (int(i.op in SIGNED_IOPS) << 10)
     if i.op in FMISC_IDX: return _rec(K_FMISC, FMISC_IDX[i.op], i.dst, i.iterations, flags, *_pack3(i.srcs))
     iop = INT_IDX[i.op]
-    fast_i = not src_half and not i.dst_half and not i.sat and not ei and iop < N_IALU32 and (is_bw or all(s.absneg == 0 for s in i.srcs))
+    fast_i = not src_half and not i.dst_half and not i.sat and iop < N_IALU32 and (is_bw or all(s.absneg == 0 for s in i.srcs))
     return _rec(K_IALU32 if fast_i else K_IMISC, iop, i.dst, i.iterations, flags, *_pack3(i.srcs))
   if isinstance(i, Cat4):
     return _rec(K_SFU, SFU_IDX[i.op], i.dst, i.iterations, int(i.dst_half) | (int(i.sat) << 1) | (int(i.srcs[0].half) << 2), *_pack3(i.srcs))
@@ -303,12 +299,11 @@ def _cov_to_float(v_f64:UOp, dst_half:bool, even:UOp) -> UOp:
   ru = r.bitcast(udt)
   rtz = ((even.eq(_c(0))) & (r.cast(dtypes.float64).abs() > v_f64.abs())).where(ru - _c(1, udt), ru)
   return _ftz_u(rtz, True).bitcast(fdt) if dst_half else rtz.bitcast(fdt)
-def _clz_u(u:UOp, bits:int, trailing:bool=False) -> UOp:
+def _clz_u(u:UOp, bits:int) -> UOp:
   dt, x, n = dtypes.uint16 if bits == 16 else dtypes.uint32, u, _c(0, dtypes.uint16 if bits == 16 else dtypes.uint32)
   for s in ([8, 4, 2, 1] if bits == 16 else [16, 8, 4, 2, 1]):
-    m = ((1 << s) - 1) if trailing else (((1 << s) - 1) << (bits - s))
-    z = (x & _c(m, dt)).eq(_c(0, dt))
-    n, x = z.where(n + _c(s, dt), n), z.where(x >> _c(s, dt) if trailing else x << _c(s, dt), x)
+    z = (x & _c(((1 << s) - 1) << (bits - s), dt)).eq(_c(0, dt))
+    n, x = z.where(n + _c(s, dt), n), z.where(x << _c(s, dt), x)
   return u.eq(_c(0, dt)).where(_c(0xFFFF if bits == 16 else 0xFFFFFFFF, dt), n)
 def _fminmax(a:UOp, b:UOp, half:bool, is_max:bool) -> UOp:
   fdt, udt = (dtypes.half, dtypes.uint16) if half else (dtypes.float32, dtypes.uint32)
@@ -506,7 +501,7 @@ def _build_vm() -> tuple[TinyELF, list[int]]:
   s_ialu32 = commit_tmp(tmp.after(sp_ia).index(l_ia).store(_sel(op, _ialu_32(a_i, b_i, c_i, 32, U32, I32))).end(l_ia),
                         dst + k_ia, _c(0)).end(k_ia).end(g_ia)
 
-  # 5. K_IMISC (16-bit int ops + sat/ei/cmp/clz/ctz/min/max/absneg/sad/signed-mod)
+  # 5. K_IMISC (16-bit int ops + absneg/cmp/clz/min/max/sad/signed-mod)
   def emit_imisc(half:bool) -> UOp:
     bits, udt, sdt, buf = (16, U16, dtypes.int16, h_buf) if half else (32, U32, I32, r_buf)
     all1 = _c(0xFFFF if half else 0xFFFFFFFF, udt)
@@ -521,14 +516,7 @@ def _build_vm() -> tuple[TinyELF, list[int]]:
       return ((s_meta[j] >> _c(4)) & _c(1)).ne(_c(0)).where(is_bw.where(u ^ all1, _c(0, udt) - u), u)
     au, bu, cu = imod(0), imod(1), imod(2)
     ai, bi = au.bitcast(sdt), bu.bitcast(sdt)
-    sat, ei = ((flags >> _c(1)) & _c(1)).ne(_c(0)), ((flags >> _c(3)) & _c(1)).ne(_c(0))
-    umax = _c(0xFFFF if half else 0xFFFFFFFF, I64)
-    smin, smax = _c(-32768 if half else -2147483648, I64), _c(32767 if half else 2147483647, I64)
-    add_u = ei.where(((au.cast(U64) + bu.cast(U64)) >> _c(1, U64)).cast(udt),
-            sat.where((au.cast(I64) + bu.cast(I64)).clamp(0, umax).cast(udt), au + bu))
-    sub_u = sat.where((au.cast(I64) - bu.cast(I64)).clamp(0, umax).cast(udt), au - bu)
-    add_s = sat.where((ai.cast(I64) + bi.cast(I64)).clamp(smin, smax).cast(sdt).bitcast(udt), au + bu)
-    sub_s = sat.where((ai.cast(I64) - bi.cast(I64)).clamp(smin, smax).cast(sdt).bitcast(udt), au - bu)
+    sat = ((flags >> _c(1)) & _c(1)).ne(_c(0))
     cond = (flags >> _c(4)) & _c(7)
     cu_b = _sel(cond, [au < bu, au <= bu, au > bu, au >= bu, au.eq(bu), au.ne(bu)])
     cs_b = _sel(cond, [ai < bi, ai <= bi, ai > bi, ai >= bi, ai.eq(bi), ai.ne(bi)])
@@ -536,12 +524,10 @@ def _build_vm() -> tuple[TinyELF, list[int]]:
     cmp_v = is_cmps_s.where(cs_b, cu_b).cast(udt)
     cmp_v = sat.where(cmp_v ^ _c(1, udt), cmp_v)
     cmp_v = ((flags >> _c(2)) & _c(1)).ne(_c(0)).where(_c(0, udt) - cmp_v, cmp_v)
-    addsub = [add_u.cast(U32), add_s.cast(U32), sub_u.cast(U32), sub_s.cast(U32)]
-    out32 = _sel(op, addsub + _ialu_32(au, bu, cu, bits, udt, sdt)[N_ADDSUB:] + [
+    out32 = _sel(op, _ialu_32(au, bu, cu, bits, udt, sdt) + [
       (au < bu).where(au, bu).cast(U32), (ai < bi).where(au, bu).cast(U32),
       (au > bu).where(au, bu).cast(U32), (ai > bi).where(au, bu).cast(U32), au.cast(U32),
-      _clz_u(au, bits).cast(U32), _clz_u((ai < _c(0, sdt)).where(au ^ all1, au), bits).cast(U32),
-      _clz_u(au, bits, True).cast(U32), (au + bu + cu).cast(U32), cmp_v.cast(U32), cmp_v.cast(U32)])
+      _clz_u(au, bits).cast(U32), (au + bu + cu).cast(U32), cmp_v.cast(U32), cmp_v.cast(U32)])
     dst_half = flags & _c(1)
     if half: out32 = (dst_half.eq(_c(0)) & is_s & _not(is_cmps_s)).where(out32.cast(U16).bitcast(dtypes.int16).cast(I32).bitcast(U32), out32)
     return commit_tmp(tmp.after(sp).index(lane).store(out32).end(lane), dst + k, dst_half).end(k).end(g)
