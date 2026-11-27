@@ -1,36 +1,28 @@
-import functools, math
-from dataclasses import dataclass, replace
-from typing import Callable, cast
+import functools, itertools, math
+from dataclasses import dataclass
+from typing import Callable
 import numpy as np
-from tinygrad.helpers import Context, getbits, to_mv
+from tinygrad.helpers import Context, getbits
 from tinygrad.runtime.autogen import mesa
-from tinygrad.uop.ops import UOp, KernelInfo
-from tinygrad.dtype import dtypes, AddrSpace
+from tinygrad.uop.ops import UOp, Ops, KernelInfo
+from tinygrad.dtype import DType, dtypes, AddrSpace
 from tinygrad.device import Device
 from tinygrad.engine.realize import get_runtime
 from tinygrad.codegen import to_program
 
-NREGS = 64 * 4
-A0, P0 = 61 * 4, 62 * 4
-TYPES = [np.dtype(t) for t in ("f2", "f4", "u2", "u4", "i2", "i4", "u1", "i1")] # last is u8_32
-HALF_TYPES = (0, 2, 4, 6, 7)
+NREGS, A0, P0, MAX_LOCAL = 64 * 4, 61 * 4, 62 * 4, 1024
+HALF_TYPES = (0, 2, 4, 6, 7) # f2, f4, u2, u4, i2, i4, u1, i1
 FLUT = [0.0, 0.5, 1.0, 2.0, math.e, math.pi, 1/math.pi, 1/math.log2(math.e), math.log2(math.e), 1/math.log2(10), math.log2(10), 4.0]
+REG_INIT = 0
 
-@functools.cache
-def view(kind:str, half:bool) -> np.dtype: return np.dtype(f"{kind}{2 if half else 4}")
 def sext(x:int, n:int) -> int: return x - (1 << n) if x & (1 << (n - 1)) else x
 
 class Field:
   def __init__(self, lo:int, hi:int|None=None): self.lo, self.hi = lo, lo if hi is None else hi
-  def __set_name__(self, owner, name): self.name = name
-  def __get__(self, i, owner=None) -> int:
-    i.__dict__[self.name] = v = getbits(i.word, self.lo, self.hi)
-    return v
+  def __get__(self, i, owner=None) -> int: return getbits(i.word, self.lo, self.hi)
 
 @dataclass(frozen=True)
-class Src:
-  kind:str; val:int; half:bool = False; absneg:int = 0; r:bool = False # noqa: E702
-  def at(self, k:int) -> "Src": return replace(self, val=self.val + k) if self.r and k else self
+class Src: kind:str; val:int; half:bool = False; absneg:int = 0; r:bool = False # noqa: E702
 
 def multisrc(x:int, half:bool, r:int) -> Src:
   absneg = getbits(x, 14, 15)
@@ -55,8 +47,6 @@ class Inst:
     self.pc, self.word = pc, word
     self.op, self.iterations = self.cat << 7 | self.opc, self.repeat + 1
   def error(self): return NotImplementedError(f"pc {self.pc}: {mesa.opc_t.get(self.op, self.op)} is not emulated {self.word:#x}")
-  @functools.cached_property
-  def repeat_srcs(self) -> list[list[Src]]: return [[s.at(k) for s in self.srcs] for k in range(self.iterations)]
 
 class Cat0(Inst):
   immed, brtype, inv2, comp2 = Field(0, 31), Field(37, 39), Field(45), Field(46, 47)
@@ -65,7 +55,7 @@ class Cat0(Inst):
     super().__init__(pc, word)
     self.op = mesa.OPC_BR + self.brtype if (self.opc_hi, self.opc) == (0, 1) else self.opc_hi << 4 | self.opc
     self.target = pc + sext(self.immed, 32)
-    if self.op not in CAT0: raise self.error()
+    if self.op not in CTRL_IDX: raise self.error()
 
 class Cat1(Inst):
   dst, repeat, src_r, dst_type, dst_rel = Field(32, 39), Field(40, 41), Field(43), Field(46, 48), Field(49)
@@ -73,26 +63,29 @@ class Cat1(Inst):
   def __init__(self, pc:int, word:int):
     super().__init__(pc, word)
     half = self.src_type in HALF_TYPES
-    if (self.multi, self.dst_rel) == (0b10, 0): # swz reads both sources before writing
+    if (self.multi, self.dst_rel) == (0b10, 0):
       self.op, self.iterations = mesa.OPC_SWZ + getbits(word, 40, 41), 1
       if self.op != mesa.OPC_SWZ: raise self.error()
       self.srcs, self.dsts = [Src("r", getbits(word, 0, 7), half), Src("r", getbits(word, 8, 15), half)], [self.dst, getbits(word, 16, 23)]
       return
     self.op = mesa.OPC_MOV
     if self.dst_rel or self.multi or self.src_mode == 0b11 or self.round > 1: raise self.error()
-    self.srcs = [Src("r", getbits(word, 0, 7), half, r=bool(self.src_r)) if self.src_mode == 0b00 else
-                 Src("c", getbits(word, 0, 10), half, r=bool(self.src_r)) if self.src_mode == 0b01 else Src("i", getbits(word, 0, 31), half)]
-    if self.src_mode == 0b00 and getbits(word, 11, 11):
-      if not getbits(word, 10, 10) or half: raise self.error()
-      self.srcs = [Src("c<", sext(getbits(word, 0, 9), 10))]
+    if self.src_mode == 0b00:
+      if getbits(word, 11, 11):
+        if not getbits(word, 10, 10) or half: raise self.error()
+        self.srcs = [Src("c<", sext(getbits(word, 0, 9), 10))]
+      else: self.srcs = [Src("r", getbits(word, 0, 7), half, r=bool(self.src_r))]
+    elif self.src_mode == 0b01: self.srcs = [Src("c", getbits(word, 0, 10), half, r=bool(self.src_r))]
+    else: self.srcs = [Src("i", getbits(word, 0, 31), half)]
 
 class Cat2(Inst):
   dst, repeat, sat, src1_r, dst_conv, ei = Field(32, 39), Field(40, 41), Field(42), Field(43), Field(46), Field(47)
   cond, src2_r, full, opc = Field(48, 50), Field(51), Field(52), Field(53, 58)
   def __init__(self, pc:int, word:int):
     super().__init__(pc, word)
-    if self.op not in CAT2 and (self.op not in CMPS or self.cond >= len(COND)): raise self.error()
+    if self.op not in ALU_OPS or (self.op in CMPS and self.cond >= 6): raise self.error()
     if self.ei and (self.op != mesa.OPC_ADD_U or not self.full): raise self.error()
+    if self.sat and self.op not in CMPS and self.op not in SAT_INT and self.op not in FLOAT_OPS: raise self.error()
     self.dst_half = (not self.full) ^ bool(self.dst_conv)
     self.srcs = [multisrc(getbits(word, 0, 15), not self.full, self.src1_r)]
     if self.op not in CAT2_1SRC: self.srcs.append(multisrc(getbits(word, 16, 31), not self.full, self.src2_r))
@@ -104,10 +97,11 @@ class Cat3(Inst):
   def __init__(self, pc:int, word:int):
     super().__init__(pc, word)
     self.op += 8 * self.alt
-    if self.op not in CAT3: raise self.error()
+    if self.op not in ALU_OPS: raise self.error()
     half = not self.sat_full if self.alt else self.op in CAT3_HALF
     self.sat, self.dst_half = 0 if self.alt else self.sat_full, half ^ bool(self.dst_conv)
     if self.op == mesa.OPC_MAD_U16: self.dst_half = not self.dst_conv
+    if self.sat and self.op not in FLOAT_OPS: raise self.error()
     self.srcs = [cat3src(self.src1, half, self.alt, self.src1_r, self.src1_neg), Src("r", self.src2, half, self.src2_neg, bool(self.src2_r)),
                  cat3src(self.src3, half, self.alt, self.src3_r, self.src3_neg)]
 
@@ -115,7 +109,7 @@ class Cat4(Inst):
   dst, repeat, sat, src_r, dst_conv, full, opc = Field(32, 39), Field(40, 41), Field(42), Field(43), Field(46), Field(52), Field(53, 58)
   def __init__(self, pc:int, word:int):
     super().__init__(pc, word)
-    if self.op not in CAT4: raise self.error()
+    if self.op not in SFU_IDX: raise self.error()
     self.dst_half, self.srcs = (not self.full) ^ bool(self.dst_conv), [multisrc(getbits(word, 0, 15), not self.full, self.src_r)]
 
 class Cat5(Inst):
@@ -172,30 +166,136 @@ class Cat7(Inst):
     super().__init__(pc, word)
     if self.op not in (mesa.OPC_BAR, mesa.OPC_FENCE): raise self.error()
 
+CMPS = {mesa.OPC_CMPS_F, mesa.OPC_CMPS_U, mesa.OPC_CMPS_S, mesa.OPC_CMPV_F, mesa.OPC_CMPV_U, mesa.OPC_CMPV_S}
+CMPV = {mesa.OPC_CMPV_F, mesa.OPC_CMPV_U, mesa.OPC_CMPV_S}
+CAT2_1SRC = {mesa.OPC_SIGN_F, mesa.OPC_ABSNEG_F, mesa.OPC_FLOOR_F, mesa.OPC_TRUNC_F, mesa.OPC_ABSNEG_S, mesa.OPC_NOT_B, mesa.OPC_CLZ_B,
+             mesa.OPC_CLZ_S, mesa.OPC_SETRM}
+BITWISE = {mesa.OPC_AND_B, mesa.OPC_OR_B, mesa.OPC_XOR_B, mesa.OPC_NOT_B}
+SAT_INT = {mesa.OPC_ADD_U, mesa.OPC_ADD_S, mesa.OPC_SUB_U, mesa.OPC_SUB_S}
+CAT3_HALF = {mesa.OPC_MAD_F16, mesa.OPC_SEL_B16, mesa.OPC_SEL_S16}
 CATS = {0: Cat0, 1: Cat1, 2: Cat2, 3: Cat3, 4: Cat4, 5: Cat5, 7: Cat7}
 CAT6 = {mesa.OPC_LDG: Ldg, mesa.OPC_STG: Stg, mesa.OPC_LDL: Load, mesa.OPC_LDP: Load, mesa.OPC_STL: Store, mesa.OPC_STP: Store}
 
 def decode_inst(pc:int, word:int) -> Inst:
   cat = getbits(word, 61, 63)
-  if cat == 6 and getbits(word, 52, 53) == 0b10 and getbits(word, 20, 22) == 0b110: return Ibo(pc, word) # bits 54-58 aren't the opcode here
+  if cat == 6 and getbits(word, 52, 53) == 0b10 and getbits(word, 20, 22) == 0b110: return Ibo(pc, word)
   cls = CAT6.get(6 << 7 | getbits(word, 54, 58)) if cat == 6 else CATS.get(cat)
   if cls is None: raise NotImplementedError(f"pc {pc}: cat{cat} is not emulated {word:#x}")
   return cls(pc, word)
 
+# VM bytecode: REC_LEN uint32 per instruction; opcode IDs are indices into the category tables below
+REC_LEN = 11
+K_UNDEF, K_FMAD32, K_FMAD16, K_FMISC, K_IALU32, K_IMISC, K_SFU, K_MOV, K_MEM, K_TEX, K_CTRL = range(11)
+SRC_KIND = {"r": 1, "c": 2, "c<": 3, "i": 4}
+ERR_MSGS = {2: "relative const out of range", 3: "out of bounds local access", 4: "out of bounds private access",
+            5: "texture is not bound", 6: "IBO is not bound", 7: "call stack overflow", 8: "ret without call"}
+FMAD_OPS = {mesa.OPC_MAD_F32, mesa.OPC_MAD_F16, mesa.OPC_ADD_F, mesa.OPC_MUL_F}
+SIGNED_IOPS = {mesa.OPC_ADD_S, mesa.OPC_SUB_S, mesa.OPC_MIN_S, mesa.OPC_MAX_S, mesa.OPC_ABSNEG_S, mesa.OPC_CLZ_S,
+               mesa.OPC_ASHR_B, mesa.OPC_SEL_S32, mesa.OPC_SEL_S16, mesa.OPC_SAD_S32, mesa.OPC_CMPS_S, mesa.OPC_CMPV_S}
+def _idx(groups:tuple[tuple[int, ...], ...]) -> dict[int, int]: return {op: i for i, g in enumerate(groups) for op in g}
+FMISC_IDX = _idx(((mesa.OPC_MIN_F,), (mesa.OPC_MAX_F,), (mesa.OPC_SIGN_F,), (mesa.OPC_ABSNEG_F,), (mesa.OPC_FLOOR_F,),
+                  (mesa.OPC_TRUNC_F,), (mesa.OPC_SEL_F32,), (mesa.OPC_CMPS_F, mesa.OPC_CMPV_F)))
+# Shared integer op indices: 0..24 are fast 32-bit ops (K_IALU32), 25..35 are misc/sat/cmp ops (K_IMISC handles all 36)
+INT_IDX = _idx((
+  (mesa.OPC_ADD_U,), (mesa.OPC_ADD_S,), (mesa.OPC_SUB_U,), (mesa.OPC_SUB_S,),
+  (mesa.OPC_AND_B,), (mesa.OPC_OR_B,), (mesa.OPC_XOR_B,), (mesa.OPC_NOT_B,),
+  (mesa.OPC_SHL_B,), (mesa.OPC_SHR_B,), (mesa.OPC_ASHR_B,), (mesa.OPC_GETBIT_B,),
+  (mesa.OPC_MUL_S24,), (mesa.OPC_MUL_U24,), (mesa.OPC_MULL_U,),
+  (mesa.OPC_MADSH_M16, mesa.OPC_MADSH_U16), (mesa.OPC_MAD_U16,), (mesa.OPC_MAD_S24,),
+  (mesa.OPC_SEL_B32, mesa.OPC_SEL_B16), (mesa.OPC_SEL_S32, mesa.OPC_SEL_S16),
+  (mesa.OPC_SHRM,), (mesa.OPC_SHRG,), (mesa.OPC_SHLG,), (mesa.OPC_SHLM,), (mesa.OPC_ANDG,),
+  (mesa.OPC_MIN_U,), (mesa.OPC_MIN_S,), (mesa.OPC_MAX_U,), (mesa.OPC_MAX_S,), (mesa.OPC_ABSNEG_S,),
+  (mesa.OPC_CLZ_B,), (mesa.OPC_CLZ_S,), (mesa.OPC_SETRM,), (mesa.OPC_SAD_S32,),
+  (mesa.OPC_CMPS_U, mesa.OPC_CMPV_U), (mesa.OPC_CMPS_S, mesa.OPC_CMPV_S)))
+SFU_IDX = _idx(((mesa.OPC_RCP,), (mesa.OPC_RSQ, mesa.OPC_HRSQ), (mesa.OPC_LOG2, mesa.OPC_HLOG2),
+                (mesa.OPC_EXP2, mesa.OPC_HEXP2), (mesa.OPC_SIN,), (mesa.OPC_SQRT,)))
+MEM_IDX = _idx(((mesa.OPC_LDG,), (mesa.OPC_STG,), (mesa.OPC_LDL,), (mesa.OPC_STL,), (mesa.OPC_LDP,), (mesa.OPC_STP,)))
+CTRL_IDX = _idx(((mesa.OPC_NOP, mesa.OPC_PREDE, mesa.OPC_FENCE), (mesa.OPC_END,), (mesa.OPC_JUMP,), (mesa.OPC_BR,), (mesa.OPC_BRAO,),
+                 (mesa.OPC_BRAA,), (mesa.OPC_PREDT,), (mesa.OPC_PREDF,), (mesa.OPC_CALL,), (mesa.OPC_RET,), (mesa.OPC_BAR,)))
+FLOAT_OPS, ALU_OPS = FMAD_OPS | FMISC_IDX.keys(), FMAD_OPS | FMISC_IDX.keys() | INT_IDX.keys()
+
+def _rec(*xs:int) -> tuple[int, ...]: return xs + (0,) * (REC_LEN - len(xs))
+def pack_src(s:Src) -> tuple[int, int]:
+  return SRC_KIND[s.kind] | (int(s.half) << 3) | (s.absneg << 4) | (int(s.r) << 6), s.val & 0xFFFFFFFF
+def _pack3(srcs:list[Src]) -> tuple[int, ...]:
+  ms, vs = zip(*(pack_src(s) for s in srcs)) if srcs else ((), ())
+  return (*ms, *(0,) * (3 - len(ms)), *vs, *(0,) * (3 - len(vs)))
+
+def encode_inst(i:Inst, pred_targets:dict[int, int]) -> tuple[int, ...]:
+  if isinstance(i, Cat0):
+    if i.op in (mesa.OPC_PREDT, mesa.OPC_PREDF):
+      return _rec(K_CTRL, CTRL_IDX[i.op], pred_targets[i.pc]) if i.pc in pred_targets else _rec(K_UNDEF)
+    return _rec(K_CTRL, CTRL_IDX[i.op], i.target, i.comp1, i.inv1 | (i.inv2 << 1) | (i.comp2 << 4))
+  if isinstance(i, Cat7): return _rec(K_CTRL, CTRL_IDX[i.op])
+  if isinstance(i, Cat1):
+    if i.op == mesa.OPC_SWZ:
+      (m0, v0), (m1, v1) = pack_src(i.srcs[0]), pack_src(i.srcs[1])
+      return (K_MOV, 1, i.dst, 1, int(i.dst_type in HALF_TYPES), m0, m1, 0, v0, v1, i.dsts[1])
+    flags = int(i.dst_type in HALF_TYPES) | (int(i.round == 1) << 2) | (i.src_type << 4) | (i.dst_type << 8)
+    return _rec(K_MOV, 0 if i.src_type == i.dst_type and i.src_type not in (6, 7) else 2, i.dst, i.iterations, flags, *_pack3(i.srcs))
+  if isinstance(i, (Cat2, Cat3)):
+    src_half = i.srcs[0].half
+    if i.op in FMAD_OPS:
+      srcs = [i.srcs[0], Src("i", 0x3C00 if src_half else 0x3F800000, src_half), i.srcs[1]] if i.op == mesa.OPC_ADD_F else \
+             [i.srcs[0], i.srcs[1], Src("i", 0x8000 if src_half else 0x80000000, src_half)] if i.op == mesa.OPC_MUL_F else i.srcs
+      return _rec(K_FMAD16 if src_half else K_FMAD32, 0, i.dst, i.iterations, int(i.dst_half) | (int(i.sat) << 1), *_pack3(srcs))
+    is_bw, ei = i.op in BITWISE, i.ei if isinstance(i, Cat2) else 0
+    cond = i.cond if isinstance(i, Cat2) and i.op in CMPS else 0
+    flags = int(i.dst_half) | (int(i.sat) << 1) | (int(i.op in CMPV) << 2) | (int(ei) << 3) | (cond << 4) | \
+            (int(is_bw) << 8) | (int(src_half) << 9) | (int(i.op in SIGNED_IOPS) << 10)
+    if i.op in FMISC_IDX: return _rec(K_FMISC, FMISC_IDX[i.op], i.dst, i.iterations, flags, *_pack3(i.srcs))
+    iop = INT_IDX[i.op]
+    fast_i = not src_half and not i.dst_half and not i.sat and not ei and iop < 25 and (is_bw or all(s.absneg == 0 for s in i.srcs))
+    return _rec(K_IALU32 if fast_i else K_IMISC, iop, i.dst, i.iterations, flags, *_pack3(i.srcs))
+  if isinstance(i, Cat4):
+    return _rec(K_SFU, SFU_IDX[i.op], i.dst, i.iterations, int(i.dst_half) | (int(i.sat) << 1) | (int(i.srcs[0].half) << 2), *_pack3(i.srcs))
+  if isinstance(i, (Load, Store)):
+    ro = getattr(i, "reg_off", None)
+    r_src2, r_sh, r_off = ro if ro is not None else (0, 0, 0)
+    flags = int(i.type in HALF_TYPES) | (int(ro is not None) << 2) | (i.type << 4) | (r_sh << 8) | (r_off << 12)
+    return (K_MEM, MEM_IDX[i.op], i.dst if isinstance(i, Load) else i.val, i.size, flags, 0, 0, 0, i.addr, i.offset & 0xFFFFFFFF, r_src2)
+  if isinstance(i, Cat5):
+    return _rec(K_TEX, 0, i.dst, i.wrmask, int(i.s2en) | (i.type << 4), 0, 0, 0, i.src1, i.src3 if i.s2en else i.tex)
+  assert isinstance(i, Ibo)
+  return _rec(K_TEX, 1, i.ssbo, i.ncomp, i.type << 4, 0, 0, 0, i.coord, i.val)
+
+def _max_reg(prog:list[Inst|None]) -> int:
+  hi = 0
+  for i in prog:
+    if i is None: continue
+    for s in getattr(i, "srcs", ()):
+      if s.kind == "r" and s.val < A0: hi = max(hi, s.val + i.iterations)
+    if hasattr(i, "dst") and not isinstance(i, Ibo) and i.dst < A0:
+      hi = max(hi, i.dst + (4 if isinstance(i, Cat5) else i.size if isinstance(i, Load) else i.iterations))
+    if isinstance(i, Cat1) and i.op == mesa.OPC_SWZ: hi = max(hi, *(r + 1 for r in i.dsts if r < A0), 0)
+    if isinstance(i, (Load, Store)):
+      if i.addr < A0: hi = max(hi, i.addr + 2)
+      if isinstance(i, Store) and i.val < A0: hi = max(hi, i.val + i.size)
+      if (ro := getattr(i, "reg_off", None)) is not None and ro[0] < A0: hi = max(hi, ro[0] + 1)
+    if isinstance(i, Cat5):
+      if i.src1 < A0: hi = max(hi, i.src1 + 2)
+      if i.s2en and i.src3 < A0: hi = max(hi, i.src3 + 1)
+    if isinstance(i, Ibo):
+      if i.coord < A0: hi = max(hi, i.coord + 2)
+      if i.val < A0: hi = max(hi, i.val + i.ncomp)
+  return min(hi, A0)
+
 @functools.cache
-def decode(image:bytes) -> list[Inst|NotImplementedError]: # padding after end may not decode
-  prog:list[Inst|NotImplementedError] = []
+def decode(image:bytes) -> tuple[np.ndarray, bool, bool, int]:
+  prog:list[Inst|None] = []
   for pc, word in enumerate(np.frombuffer(image, np.uint64).tolist()):
     try: prog.append(decode_inst(pc, word))
-    except NotImplementedError as e: prog.append(e)
+    except NotImplementedError: prog.append(None)
   preds = [i for i in prog if isinstance(i, Cat0) and i.op in (mesa.OPC_PREDT, mesa.OPC_PREDF, mesa.OPC_PREDE)]
-  pad = [*preds, None, None]
-  for i, nxt, after in zip(preds, pad[1:], pad[2:]):
+  pred_targets:dict[int, int] = {}
+  for idx, i in enumerate(preds):
     if i.op == mesa.OPC_PREDE: continue
-    if nxt is not None and nxt.op == mesa.OPC_PREDE: i.target = nxt.pc
-    elif nxt is not None and nxt.op != i.op and after is not None and after.op == mesa.OPC_PREDE: i.target = nxt.pc + 1
-    else: prog[i.pc] = i.error()
-  return prog
+    nxt, after = preds[idx + 1] if idx + 1 < len(preds) else None, preds[idx + 2] if idx + 2 < len(preds) else None
+    if nxt is not None and nxt.op == mesa.OPC_PREDE: pred_targets[i.pc] = nxt.pc
+    elif nxt is not None and nxt.op != i.op and after is not None and after.op == mesa.OPC_PREDE: pred_targets[i.pc] = nxt.pc + 1
+  recs = [encode_inst(i, pred_targets) if i is not None else _rec(K_UNDEF) for i in prog]
+  ops = {i.op for i in prog if isinstance(i, (Load, Store))}
+  return np.array(recs, np.uint32).reshape(-1), bool(ops & {mesa.OPC_LDL, mesa.OPC_STL}), bool(ops & {mesa.OPC_LDP, mesa.OPC_STP}), _max_reg(prog)
 
 @dataclass(frozen=True)
 class Image: addr:int; width:int; height:int; pitch:int; dtype:np.dtype # noqa: E702
@@ -203,482 +303,499 @@ class Image: addr:int; width:int; height:int; pitch:int; dtype:np.dtype # noqa: 
 @dataclass(frozen=True)
 class Dispatch:
   image:bytes; consts:np.ndarray; local_size:tuple[int, ...]; groups:tuple[int, ...]; localid_reg:int; wgid_reg:int # noqa: E702
-  lmem_size:int; pvt_size:int; ranges:list[tuple[int, int]]; textures:list[Image]; ibos:list[Image]; demote:bool; samplers:list[bool] # noqa: E702
-  entry:int; merged:bool # noqa: E702
+  lmem_size:int; pvt_size:int; textures:list[Image]; ibos:list[Image]; demote:bool; entry:int # noqa: E702
 
-class MergedHalf: # hrN.c is the low (c even) or high half of full component (N*4+c) // 2
-  def __init__(self, r:np.ndarray): self.r16 = r.view(np.uint16)
-  def __getitem__(self, k:int) -> np.ndarray: return self.r16[k // 2][k % 2::2]
-  def __setitem__(self, k:int|tuple[int, np.ndarray], v:np.ndarray):
-    if isinstance(k, tuple): self[k[0]][k[1]] = v
-    else: self[k][:] = v
-
-class Threads:
-  def __init__(self, d:Dispatch, n:int):
-    self.d, self.r = d, np.zeros((NREGS, n), np.uint32)
-    self.h:np.ndarray|MergedHalf = MergedHalf(self.r) if d.merged else np.zeros((NREGS, n), np.uint16)
-    self.everyone = self.mask = np.ones(n, bool)
-    self.maps = sorted(d.ranges)
-    self.starts, self.ends = np.array([s for s,_ in self.maps], np.uint64), np.array([s + sz for s,sz in self.maps], np.uint64)
-    self.bufs:dict[int, np.ndarray] = {}
-    self.mems:dict[int, tuple[np.ndarray, np.ndarray, int]] = {}
-
-  def buf(self, k:int) -> np.ndarray:
-    if k not in self.bufs: self.bufs[k] = np.frombuffer(to_mv(*self.maps[k]), np.uint8)
-    return self.bufs[k]
-
-  def read(self, s:Src, dt:np.dtype) -> np.ndarray:
-    if s.kind == "r":
-      raw = (self.h if s.half and s.val < A0 else self.r)[s.val]
-      if s.half and raw.dtype == np.uint32: raw = raw.astype(np.uint16)
-    elif s.kind == "c<":
-      idx = self.r[A0].view(np.int32).astype(np.int64) + s.val
-      if (self.mask & ((idx < 0) | (idx >= len(self.d.consts)))).any(): raise RuntimeError(f"relative const c<a0.x + {s.val}> out of range")
-      raw = self.d.consts[np.clip(idx, 0, len(self.d.consts) - 1)]
-    else:
-      if s.kind == "c": c = int(self.d.consts[s.val] if self.d.demote or not s.half else self.d.consts.view(np.uint16)[s.val])
-      else: c = s.val & 0xFFFFFFFF
-      if s.kind == "c" and s.half and dt == np.float16 and self.d.demote:
-        c = int(np.uint32(c).view(np.float32).astype(np.float16).view(np.uint16))
-      raw = np.full(self.mask.shape, c & 0xFFFF if s.half else c, view("u", s.half))
-    v = raw.view(dt) if raw.dtype.itemsize == dt.itemsize else raw.astype(dt)
-    if s.absneg & 2: v = np.abs(v)
-    if s.absneg & 1: v = -v
-    return v
-
-  def write(self, regid:int, half:bool, v:np.ndarray, mask:np.ndarray|None=None):
-    if regid >= A0: half = False
-    if half and v.dtype == np.float32: v = cov_to_float(v, np.dtype(np.float16))
-    v, mask = v.astype(view("f" if v.dtype.kind == "f" else "u", half), copy=False).view(view("u", half)), self.mask if mask is None else mask
-    if mask is self.everyone: (self.h if half else self.r)[regid] = v
-    else: (self.h if half else self.r)[regid, mask] = v[mask]
-
-def bits(v): return np.unpackbits(v.astype(f"<u{v.dtype.itemsize}").view(np.uint8).reshape(len(v), -1), axis=1, bitorder="little")
-def first_set(b, v): return np.where(b.any(axis=1), b.argmax(axis=1), -1).astype(v.dtype)
-def clz(v): return first_set(bits(v)[:, ::-1], v)
-def ctz(v): return first_set(bits(v), v)
-def fmax(a, b): # +0 above -0, numpy's fmax only does that on some cpus
-  return np.where((a == 0) & (b == 0), np.where(np.signbit(a) & np.signbit(b), -np.abs(a), np.abs(a)), np.fmax(a, b))
-def fmin(a, b): return -fmax(-a, -b)
-def sign(v): # a zero keeps its sign, NaN gives +0
-  one = v.dtype.type(1)
-  return np.where(np.isnan(v), v.dtype.type(0), np.where(v > 0, one, np.where(v < 0, -one, v)))
-def lo(v, n): return v & v.dtype.type(((1 << n) - 1) & np.iinfo(v.dtype).max)
-def s24(v): return (v.astype(np.int32) << 8) >> 8
-def shamt(a, b): return b & b.dtype.type(8 * a.dtype.itemsize - 1)
-
-COND = [np.less, np.less_equal, np.greater, np.greater_equal, np.equal, np.not_equal]
-CMPS = {mesa.OPC_CMPS_F: "f", mesa.OPC_CMPS_U: "u", mesa.OPC_CMPS_S: "i", mesa.OPC_CMPV_F: "f", mesa.OPC_CMPV_U: "u", mesa.OPC_CMPV_S: "i"}
-CMPV = {mesa.OPC_CMPV_F, mesa.OPC_CMPV_U, mesa.OPC_CMPV_S}
-CAT2_1SRC = {mesa.OPC_SIGN_F, mesa.OPC_ABSNEG_F, mesa.OPC_FLOOR_F, mesa.OPC_TRUNC_F, mesa.OPC_ABSNEG_S, mesa.OPC_NOT_B, mesa.OPC_CLZ_B,
-             mesa.OPC_CLZ_S, mesa.OPC_SETRM}
-BITWISE = {mesa.OPC_AND_B, mesa.OPC_OR_B, mesa.OPC_XOR_B, mesa.OPC_NOT_B}
-SAT_INT = {mesa.OPC_ADD_U, mesa.OPC_ADD_S, mesa.OPC_SUB_U, mesa.OPC_SUB_S}
-CAT0 = {mesa.OPC_NOP, mesa.OPC_END, mesa.OPC_JUMP, mesa.OPC_CALL, mesa.OPC_RET, mesa.OPC_BR, mesa.OPC_BRAO, mesa.OPC_BRAA,
-        mesa.OPC_PREDT, mesa.OPC_PREDF, mesa.OPC_PREDE}
-CAT2:dict[int, tuple[str, Callable]] = {
-  mesa.OPC_ADD_F: ("f", np.add), mesa.OPC_MIN_F: ("f", fmin), mesa.OPC_MAX_F: ("f", fmax), mesa.OPC_MUL_F: ("f", np.multiply),
-  mesa.OPC_SIGN_F: ("f", sign), mesa.OPC_ABSNEG_F: ("f", np.positive), mesa.OPC_FLOOR_F: ("f", np.floor), mesa.OPC_TRUNC_F: ("f", np.trunc),
-  mesa.OPC_ADD_U: ("u", np.add), mesa.OPC_ADD_S: ("i", np.add), mesa.OPC_SUB_U: ("u", np.subtract), mesa.OPC_SUB_S: ("i", np.subtract),
-  mesa.OPC_MIN_U: ("u", np.minimum), mesa.OPC_MIN_S: ("i", np.minimum),
-  mesa.OPC_MAX_U: ("u", np.maximum), mesa.OPC_MAX_S: ("i", np.maximum), mesa.OPC_ABSNEG_S: ("i", np.positive),
-  mesa.OPC_AND_B: ("u", np.bitwise_and), mesa.OPC_OR_B: ("u", np.bitwise_or), mesa.OPC_NOT_B: ("u", np.invert),
-  mesa.OPC_XOR_B: ("u", np.bitwise_xor), mesa.OPC_MUL_S24: ("u", lambda a, b: s24(a) * s24(b)),
-  mesa.OPC_MUL_U24: ("u", lambda a, b: lo(a.astype(np.uint32), 24) * lo(b.astype(np.uint32), 24)),
-  mesa.OPC_MULL_U: ("u", lambda a, b: lo(a, 16) * lo(b, 16)), mesa.OPC_CLZ_B: ("u", clz), mesa.OPC_SETRM: ("u", ctz),
-  mesa.OPC_CLZ_S: ("i", lambda a: clz(np.where(a < 0, ~a, a))),
-  mesa.OPC_SHL_B: ("u", lambda a, b: a << shamt(a, b)), mesa.OPC_SHR_B: ("u", lambda a, b: a >> shamt(a, b)),
-  mesa.OPC_ASHR_B: ("i", lambda a, b: a >> shamt(a, b)), mesa.OPC_GETBIT_B: ("u", lambda a, b: (a >> shamt(a, b)) & a.dtype.type(1))}
-CAT3_HALF = {mesa.OPC_MAD_F16, mesa.OPC_SEL_B16, mesa.OPC_SEL_S16}
-CAT3:dict[int, tuple[str, Callable]] = {
-  mesa.OPC_MADSH_M16: ("u", lambda a, b, c: (lo(a, 16) * (b >> 16) << 16) + c),
-  mesa.OPC_MADSH_U16: ("u", lambda a, b, c: (lo(a, 16) * (b >> 16) << 16) + c), mesa.OPC_MAD_U16: ("u", lambda a, b, c: lo(a, 16) * lo(b, 16) + c),
-  mesa.OPC_MAD_S24: ("u", lambda a, b, c: s24(a) * s24(b) + c),
-  mesa.OPC_SEL_S32: ("i", lambda a, b, c: np.where(b >= 0, a, c)), mesa.OPC_SEL_S16: ("i", lambda a, b, c: np.where(b >= 0, a, c)),
-  mesa.OPC_SEL_F32: ("f", lambda a, b, c: np.where(b >= 0, a, c)),
-  mesa.OPC_MAD_F16: ("f", lambda a, b, c: ftz(a * b) + c), mesa.OPC_MAD_F32: ("f", lambda a, b, c: ftz(a * b) + c),
-  mesa.OPC_SEL_B16: ("u", lambda a, b, c: np.where(b != 0, a, c)), mesa.OPC_SEL_B32: ("u", lambda a, b, c: np.where(b != 0, a, c)),
-  mesa.OPC_SHRM: ("u", lambda a, b, c: (b >> shamt(b, a)) & c), mesa.OPC_SHRG: ("u", lambda a, b, c: (b >> shamt(b, a)) | c),
-  mesa.OPC_SHLG: ("u", lambda a, b, c: (b << shamt(b, a)) | c),
-  mesa.OPC_SHLM: ("u", lambda a, b, c: (b << shamt(b, a)) & c), mesa.OPC_ANDG: ("u", lambda a, b, c: (b & a) | c),
-  mesa.OPC_SAD_S32: ("i", lambda a, b, c: a + b + c)}
-CAT4:dict[int, Callable] = {mesa.OPC_RCP: np.reciprocal, mesa.OPC_RSQ: lambda x: 1 / np.sqrt(x), mesa.OPC_LOG2: np.log2,
-  mesa.OPC_EXP2: np.exp2, mesa.OPC_SIN: np.sin, mesa.OPC_SQRT: np.sqrt, mesa.OPC_HRSQ: lambda x: 1 / np.sqrt(x), mesa.OPC_HLOG2: np.log2,
-  mesa.OPC_HEXP2: np.exp2}
-
-def cov_to_float(v, dt, even=False):
-  with np.errstate(over="ignore"): r = v.astype(dt)
-  if not even: r = np.where(np.abs(r.astype(np.float64)) > np.abs(v.astype(np.float64)), np.nextafter(r, dt.type(0)), r).astype(dt)
-  return ftz(r) if dt == np.float16 else r
-
-def exec_mov(t:Threads, i:Cat1, k:int):
-  if i.op != mesa.OPC_MOV:
-    vals = [t.read(s, view("u", s.half)).copy() for s in i.srcs] # read returns views of the register file
-    for d, v in zip(i.dsts, vals): t.write(d, i.dst_type in HALF_TYPES, v)
-    return
-  src_dt, dst_dt = TYPES[i.src_type], TYPES[i.dst_type]
-  v = t.read(i.repeat_srcs[k][0], src_dt)
-  if src_dt.itemsize == 1: v = v.view(np.int8) # cov from u8 sign-extends
-  if v.dtype.kind == "f" and dst_dt.kind != "f":
-    v = np.clip(np.trunc(np.nan_to_num(v.astype(np.float64))), np.iinfo(dst_dt).min, np.iinfo(dst_dt).max)
-  elif dst_dt.kind == "f" and v.dtype != dst_dt: v = cov_to_float(v, dst_dt, even=i.round == 1)
-  t.write(i.dst + k, i.dst_type in HALF_TYPES, v.astype(dst_dt, copy=False))
-
-def ftz(v): # float alu flushes denormal sources and results, cov doesn't
-  if v.dtype.kind != "f" or not (mask := np.abs(v) < np.finfo(v.dtype).tiny).any(): return v
-  return np.where(mask, np.copysign(v.dtype.type(0), v), v)
-
-def canonical_nan(v):
-  if v.dtype.kind != "f" or not (mask := np.isnan(v)).any(): return v
-  return np.where(mask, v.dtype.type(np.nan), v)
-
-def exec_alu(t:Threads, i:Cat2|Cat3|Cat4, k:int):
-  srcs = i.repeat_srcs[k]
-  if isinstance(i, Cat2) and i.op in CMPS:
-    out = COND[i.cond](*[ftz(t.read(s, view(CMPS[i.op], s.half))) for s in srcs]).astype(view("u", srcs[0].half))
-    if i.sat: out = out ^ out.dtype.type(1)
-    if i.op in CMPV: out = -out
-  elif isinstance(i, Cat4): # f64 since numpy's f32 results vary by cpu
-    x = ftz(t.read(srcs[0], view("f", srcs[0].half)))
-    out = CAT4[i.op](x.astype(np.float64)).astype(np.float32)
-    if x.dtype == np.float16: out = cov_to_float(out, np.dtype(np.float16))
-  elif i.op in BITWISE: # (neg) is a bitwise not here
-    out = CAT2[i.op][1](*[~t.read(replace(s, absneg=0), view("u", s.half)) if s.absneg & 1 else t.read(s, view("u", s.half)) for s in srcs])
-  elif isinstance(i, Cat2) and i.ei:
-    out = ((t.read(srcs[0], np.dtype(np.uint32)).astype(np.uint64) + t.read(srcs[1], np.dtype(np.uint32))) >> np.uint64(1)).astype(np.uint32)
-  elif isinstance(i, Cat2) and i.sat and i.op in SAT_INT:
-    kind, fn = CAT2[i.op]
-    vals = [t.read(s, view(kind, s.half)) for s in srcs]
-    out = np.clip(fn(*[v.astype(np.int64) for v in vals]), np.iinfo(vals[0].dtype).min, np.iinfo(vals[0].dtype).max).astype(vals[0].dtype)
-  else:
-    kind, fn = (CAT2 if isinstance(i, Cat2) else CAT3)[i.op]
-    out = fn(*[ftz(t.read(s, view(kind, s.half))) for s in srcs])
-  out = ftz(out) if i.op == mesa.OPC_SEL_F32 else canonical_nan(ftz(out))
-  sat = i.sat and not (isinstance(i, Cat2) and i.op in CMPS) and i.op not in SAT_INT
-  if sat and out.dtype.kind != "f": raise i.error()
-  t.write(i.dst + k, i.dst_half, np.clip(out, 0, 1) if sat else out)
-
-def global_lanes(t:Threads, i:Ldg|Stg, nbytes:int) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-  addrs = (t.r[i.addr].astype(np.uint64) | (t.r[i.addr + 1].astype(np.uint64) << np.uint64(32))) + np.uint64(i.offset & (2**64 - 1))
-  if i.reg_off is not None:
-    src2, shift, off = i.reg_off
-    addrs += ((t.r[src2].astype(np.uint64) << np.uint64(shift)) + np.uint64(off)) * np.uint64(TYPES[i.type].itemsize)
-  which = np.searchsorted(t.starts, addrs, side="right").astype(np.int64) - 1
-  if (bad := t.mask & ((which < 0) | (addrs + np.uint64(nbytes) > t.ends[np.maximum(which, 0)]))).any():
-    raise RuntimeError(f"pc {i.pc}: out of bounds global access at {int(addrs[np.argmax(bad)]):#x}")
-  ret = []
-  for k in np.unique(which[t.mask]).tolist():
-    lanes = t.mask & (which == k)
-    ret.append((lanes, t.buf(k), (addrs[lanes] - np.uint64(t.maps[k][0])).astype(np.int64)))
-  return ret
-
-def exec_mem(t:Threads, i:Load|Store, k:int):
-  dt, half = TYPES[i.type], i.type in HALF_TYPES
-  if isinstance(i, (Ldg, Stg)): views = global_lanes(t, i, dt.itemsize * i.size)
-  else:
-    mem, base, size = t.mems[i.op]
-    offs = t.r[i.addr][t.mask].astype(np.int64) + i.offset
-    bad = (offs < 0) | (offs + dt.itemsize * i.size > size)
-    if bad.any() and i.op != mesa.OPC_LDP: raise RuntimeError(f"pc {i.pc}: out of bounds local/private access")
-    lanes, outside = t.mask.copy(), t.mask.copy()
-    lanes[t.mask], outside[t.mask] = ~bad, bad
-    if bad.any() and isinstance(i, Load): # ldp past the private size reads 0
-      for c in range(i.size): t.write(i.dst + c, half, np.zeros(len(t.mask), dt), outside)
-    views = [(lanes, mem, (base[t.mask] + offs)[~bad])]
-  for lanes, mem, offs in views:
-    for c in range(i.size):
-      idx = offs[:, None] + np.arange(dt.itemsize) + c * dt.itemsize
-      if isinstance(i, Load):
-        v = np.zeros(len(lanes), dt)
-        v[lanes] = mem[idx].copy().view(dt).reshape(-1)
-        t.write(i.dst + c, half, v, lanes)
-      else:
-        row = (t.h if half else t.r)[i.val + c][lanes]
-        mem[idx] = (row.astype(np.uint8) if dt.itemsize == 1 else row).view(np.uint8).reshape(-1, dt.itemsize)
-
-def texels(img:Image, x:np.ndarray, y:np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-  ok = (x < img.width) & (y < img.height)
-  return np.frombuffer(to_mv(img.addr, img.pitch * img.height), img.dtype), ok, \
-         np.where(ok, y.astype(np.int64) * (img.pitch // img.dtype.itemsize) + x.astype(np.int64) * 4, 0)
-
-def exec_isams(t:Threads, insts:tuple[Cat5, ...]):
-  i, tex = insts[0], insts[0].tex
-  if i.s2en:
-    if len(idx := np.unique(t.h[i.src3][t.mask])) != 1: raise i.error()
-    tex = int(idx[0])
-  if tex >= len(t.d.textures): raise RuntimeError(f"pc {i.pc}: texture {tex} is not bound")
-  if not i.s2en and (i.samp >= len(t.d.samplers) or not t.d.samplers[i.samp]): raise RuntimeError(f"pc {i.pc}: unsupported sampler {i.samp}")
-  img, dt, channels = t.d.textures[tex], TYPES[i.type], wrmask_channels(i.wrmask)
-  if len(channels) == 0: return
-  if isinstance(t.h, np.ndarray) and img.dtype in TEX_DTYPES and dt in TEX_DTYPES and all(j.dst + len(channels) <= A0 for j in insts):
-    recs = np.array([(j.src1, j.dst) for j in insts], np.int32)
-    tmp = np.empty(len(channels) * t.r.shape[1], dt)
-    isam_kernel(img.dtype, dt, i.wrmask)(t.r.ctypes.data, t.mask.ctypes.data, img.addr, recs.ctypes.data, tmp.ctypes.data, t.h.ctypes.data,
-                                         n=t.r.shape[1], count=len(recs), width=img.width, height=img.height, pitch=img.pitch // img.dtype.itemsize)
-    return
-  for j in insts:
-    mem, ok, off = texels(img, t.r[j.src1], t.r[j.src1 + 1])
-    values = mem[off[:, None] + channels]
-    values[~ok] = 0
-    values = values.astype(dt, copy=False)
-    for n in range(len(channels)): t.write(j.dst + n, dt == np.float16, values[:, n])
-
-def exec_isam(t:Threads, i:Cat5, k:int): exec_isams(t, (i,))
-
-def exec_ibo(t:Threads, i:Ibo, k:int):
-  if i.ssbo >= len(t.d.ibos): raise RuntimeError(f"pc {i.pc}: IBO {i.ssbo} is not bound")
-  img, dt = t.d.ibos[i.ssbo], TYPES[i.type]
-  mem, ok, off = texels(img, t.r[i.coord], t.r[i.coord + 1])
-  lanes, regs = t.mask & ok, t.h if dt == np.float16 else t.r
-  for c in range(i.ncomp): mem[off[lanes] + c] = regs[i.val + c].view(dt)[lanes].astype(img.dtype)
-
-BRANCHES = {mesa.OPC_JUMP, mesa.OPC_PREDT, mesa.OPC_PREDF, mesa.OPC_BR, mesa.OPC_BRAO, mesa.OPC_BRAA}
-JUMPS = BRANCHES | {mesa.OPC_CALL}
-
-def taken(t:Threads, i:Cat0) -> np.ndarray:
-  if i.op == mesa.OPC_JUMP: return t.everyone
-  if i.op in (mesa.OPC_PREDT, mesa.OPC_PREDF): return (t.r[P0] != 0) == (i.op == mesa.OPC_PREDF)
-  cond = (t.r[P0 + i.comp1] != 0) ^ bool(i.inv1)
-  if i.op == mesa.OPC_BRAO: cond |= (t.r[P0 + i.comp2] != 0) ^ bool(i.inv2)
-  if i.op == mesa.OPC_BRAA: cond &= (t.r[P0 + i.comp2] != 0) ^ bool(i.inv2)
-  return cond
-
-def is_nop(i:Inst|NotImplementedError) -> bool: return isinstance(i, Cat0) and i.op == mesa.OPC_NOP
+def _c(v:int|float|bool, dt:DType=dtypes.uint32) -> UOp: return UOp.const(v, dt)
+def _sel(idx:UOp, vals:list[UOp]) -> UOp:
+  return functools.reduce(lambda acc, iv: idx.eq(_c(iv[0])).where(iv[1], acc), reversed(list(enumerate(vals[:-1]))), vals[-1])
+def _ftz_u(u:UOp, half:bool) -> UOp:
+  sign, tiny, dt = (0x8000, 0x0400, dtypes.uint16) if half else (0x80000000, 0x00800000, dtypes.uint32)
+  return ((u & _c(sign - 1, dt)) < _c(tiny, dt)).where(u & _c(sign, dt), u)
+def _ftz(f:UOp, half:bool) -> UOp:
+  return _ftz_u(f.bitcast(dtypes.uint16 if half else dtypes.uint32), half).bitcast(dtypes.half if half else dtypes.float32)
+def _cnan_u(u:UOp, half:bool) -> UOp:
+  sign, inf, qnan, dt = (0x8000, 0x7C00, 0x7E00, dtypes.uint16) if half else (0x80000000, 0x7F800000, 0x7FC00000, dtypes.uint32)
+  return ((u & _c(sign - 1, dt)) > _c(inf, dt)).where(_c(qnan, dt), u)
+def _isnan(f:UOp, half:bool) -> UOp:
+  sign, inf, dt = (0x8000, 0x7C00, dtypes.uint16) if half else (0x80000000, 0x7F800000, dtypes.uint32)
+  return (f.bitcast(dt) & _c(sign - 1, dt)) > _c(inf, dt)
+def _cov_to_float(v_f64:UOp, dst_half:bool, even:UOp) -> UOp:
+  fdt, udt = (dtypes.half, dtypes.uint16) if dst_half else (dtypes.float32, dtypes.uint32)
+  r = v_f64.cast(fdt)
+  ru = r.bitcast(udt)
+  rtz = ((even.eq(_c(0))) & (r.cast(dtypes.float64).abs() > v_f64.abs())).where(ru - _c(1, udt), ru)
+  return _ftz_u(rtz, True).bitcast(fdt) if dst_half else rtz.bitcast(fdt)
+def _clz_u(u:UOp, bits:int, trailing:bool=False) -> UOp:
+  dt, x, n = dtypes.uint16 if bits == 16 else dtypes.uint32, u, _c(0, dtypes.uint16 if bits == 16 else dtypes.uint32)
+  for s in ([8, 4, 2, 1] if bits == 16 else [16, 8, 4, 2, 1]):
+    m = ((1 << s) - 1) if trailing else (((1 << s) - 1) << (bits - s))
+    z = (x & _c(m, dt)).eq(_c(0, dt))
+    n, x = z.where(n + _c(s, dt), n), z.where(x >> _c(s, dt) if trailing else x << _c(s, dt), x)
+  return u.eq(_c(0, dt)).where(_c(0xFFFF if bits == 16 else 0xFFFFFFFF, dt), n)
+def _fminmax(a:UOp, b:UOp, half:bool, is_max:bool) -> UOp:
+  fdt, udt = (dtypes.half, dtypes.uint16) if half else (dtypes.float32, dtypes.uint32)
+  z = _c(0.0, fdt)
+  zres = ((a.bitcast(udt) & b.bitcast(udt)) if is_max else (a.bitcast(udt) | b.bitcast(udt))).bitcast(fdt)
+  return _isnan(a, half).where(b, _isnan(b, half).where(a, (a.eq(z) & b.eq(z)).where(zres, ((a > b) if is_max else (a < b)).where(a, b))))
+def _sat_f(fval:UOp, half:bool) -> UOp:
+  fdt = dtypes.half if half else dtypes.float32
+  z, one = _c(0.0, fdt), _c(1.0, fdt)
+  return _isnan(fval, half).where(fval, (fval < z).where(z, (fval > one).where(one, fval)))
 
 @functools.cache
-def block_starts(image:bytes, entry:int) -> set[int]: return {entry} | {i.target for i in decode(image) if isinstance(i, Cat0) and i.op in JUMPS}
+def vm_kernel() -> Callable[..., None]:
+  I32, U32, U16, U8, U64, I64 = dtypes.int32, dtypes.uint32, dtypes.uint16, dtypes.uint8, dtypes.uint64, dtypes.int64
+  F32, F64, F16 = dtypes.float32, dtypes.float64, dtypes.half
+  def _ci(v:int) -> UOp: return UOp.const(v, I32)
+  def _not(b:UOp) -> UOp: return b.eq(UOp.const(False, dtypes.bool))
+  ax = itertools.count().__next__
+  prog, consts = UOp.param(0, U32, 1 << 22, name="prog"), UOp.param(1, U32, 4096, name="consts")
+  vmem = UOp.param(2, U8, 1 << 46, name="vmem")
+  r_buf, h_buf = UOp.param(3, U32, (NREGS + 3) * MAX_LOCAL, name="r"), UOp.param(4, U16, (NREGS + 3) * MAX_LOCAL, name="h")
+  lmem, pvt = UOp.param(5, U8, 1 << 20, name="lmem"), UOp.param(6, U8, 1 << 26, name="pvt")
+  tex_m, ibo_m = UOp.param(7, U64, 1024 * 5, name="tex_m"), UOp.param(8, U64, 1024 * 5, name="ibo_m")
+  err, p_i = UOp.param(9, I32, 2, name="err"), UOp.param(10, I32, 16, name="p_i")
+  vmem16, vmem32 = UOp.param(11, U16, 1 << 45, name="vmem16"), UOp.param(12, U32, 1 << 44, name="vmem32")
+  st_pc, st_done = UOp.alloc((MAX_LOCAL,), I32, 0, AddrSpace.REG), UOp.alloc((MAX_LOCAL,), U8, 1, AddrSpace.REG)
+  st_blk, st_dep = UOp.alloc((MAX_LOCAL,), U8, 2, AddrSpace.REG), UOp.alloc((MAX_LOCAL,), I32, 3, AddrSpace.REG)
+  st_calls = UOp.alloc((16 * MAX_LOCAL,), I32, 4, AddrSpace.REG)
+  st_uni, st_cur = UOp.alloc((1,), I32, 5, AddrSpace.REG), UOp.alloc((1,), I32, 6, AddrSpace.REG)
+  st_go = UOp.alloc((1,), U8, 7, AddrSpace.REG)
+  tmp, tmp_f64 = UOp.alloc((MAX_LOCAL,), U32, 8, AddrSpace.REG), UOp.alloc((MAX_LOCAL,), F64, 9, AddrSpace.REG)
 
-def straight_runs(prog:list, starts:set[int], key:Callable) -> list[tuple[int, int, list]]:
-  runs, pc = [], 0
-  while pc < len(prog):
-    if (k := key(prog[pc])) is None:
-      pc += 1
-      continue
-    start, insts = pc, [prog[pc]]
-    pc += 1
-    while pc < len(prog) and pc not in starts and (is_nop(prog[pc]) or key(prog[pc]) == k):
-      if not is_nop(prog[pc]): insts.append(prog[pc])
-      pc += 1
-    runs.append((start, pc, insts))
-  return runs
+  n_local, n_groups, lx, ly, gx, gy, lid_reg, wgid_reg = [p_i.index(j).load() for j in range(8)]
+  lmem_sz, pvt_sz, n_tex, n_ibo, demote, entry, reg_init_i, n_init = [p_i.index(j).load() for j in range(8, 16)]
+  reg_init = reg_init_i.cast(U32)
+  init_err = UOp.group(err.index(0).store(_ci(0)), err.index(1).store(_ci(0)))
 
-MAX_BLOCK_LANES = 2**23 # reg * n + lane stays in int32
-MAX_RECORDS, RECORD_LEN = 2**16, 11
-U32 = 2**32 - 1
-def f32_bits(x:float) -> int: return int(np.float32(x).view(np.uint32))
-SIGN, INF, TINY, NAN = f32_bits(-0.0), f32_bits(np.inf), f32_bits(float(np.finfo(np.float32).tiny)), f32_bits(np.nan)
+  wg = UOp.range(n_groups, ax())
+  r_i, s_i = UOp.range(n_init * n_local, ax()), UOp.range((NREGS - A0) * n_local, ax())
+  lm_i, pv_i = UOp.range(lmem_sz, ax()), UOp.range(pvt_sz * n_local, ax())
+  init_r = UOp.group(
+    UOp.group(r_buf.after(init_err, wg).index(r_i).store(reg_init),
+              h_buf.after(init_err, wg).index(r_i).store((reg_init & _c(0xFFFF)).cast(U16))).end(r_i),
+    r_buf.after(init_err, wg).index(_ci(A0) * n_local + s_i).store(reg_init).end(s_i))
+  l0 = UOp.range(n_local, ax())
+  g_xyz = [(wg % gx).cast(U32), ((wg // gx) % gy).cast(U32), (wg // (gx * gy)).cast(U32)]
+  l_xyz = [(l0 % lx).cast(U32), ((l0 // lx) % ly).cast(U32), (l0 // (lx * ly)).cast(U32)]
+  has_lid, has_wg = lid_reg.ne(_ci(0xfc)), wgid_reg.ne(_ci(0xfc))
+  init_ids = UOp.group(
+    *[r_buf.after(init_r).index(((lid_reg + _ci(j)) * n_local + l0).valid(has_lid)).store(l_xyz[j]) for j in range(3)],
+    *[r_buf.after(init_r).index(((wgid_reg + _ci(j)) * n_local + l0).valid(has_wg)).store(g_xyz[j]) for j in range(3)],
+    st_pc.after(init_r).index(l0).store(entry), st_done.after(init_r).index(l0).store(_c(0, U8)),
+    st_blk.after(init_r).index(l0).store(_c(0, U8)), st_dep.after(init_r).index(l0).store(_ci(0))).end(l0)
+  init_wg = UOp.group(lmem.after(init_err, wg).index(lm_i).store(_c(0, U8)).end(lm_i),
+                      pvt.after(init_err, wg).index(pv_i).store(_c(0, U8)).end(pv_i),
+                      init_ids, st_uni.after(init_r).index(0).store(entry), st_go.after(init_r).index(0).store(_c(1, U8)))
 
-def lane_params() -> tuple[UOp, UOp, UOp]:
-  r = UOp.param(0, dtypes.uint32, NREGS * MAX_BLOCK_LANES, name="r")
-  mask = UOp.param(1, dtypes.uint8, MAX_BLOCK_LANES, name="mask")
-  return r, mask, UOp.variable("n", 1, MAX_BLOCK_LANES)
+  loop = UOp.loop(ax()).replace(src=(UOp(Ops.NOOP).after(init_wg),))
+  uni = st_uni.after(loop).index(0).load()
+  is_uni = uni >= _ci(0)
 
-def cpu_kernel(body:UOp, name:str) -> Callable[..., None]:
-  with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", CAPTURE_PROCESS_REPLAY=0):
-    prg = to_program(UOp.sink(body, arg=KernelInfo(name=name)), Device['CPU'].renderer)
-  runtime, keys = get_runtime('CPU', prg), [p.arg.name if p.addrspace is AddrSpace.ALU else p.arg.slot for p in prg.kernel_params]
-  return lambda *bufs, **vals: runtime(*[vals[k] if isinstance(k, str) else bufs[k] for k in keys])
+  g_div, l_min = UOp.range(_not(is_uni).cast(I32), ax()), UOp.range(n_local, ax())
+  d_l, b_l = st_done.after(loop, g_div).index(l_min).load(), st_blk.after(loop, g_div).index(l_min).load()
+  p_l = st_pc.after(loop, g_div).index(l_min).load()
+  any_undone = d_l.eq(_c(0, U8)).cast(I32).reduce(l_min, arg=Ops.MAX)
+  min_pc = -(d_l.eq(_c(0, U8)) & b_l.eq(_c(0, U8))).where(-p_l, _ci(-0x7FFFFFFF)).reduce(l_min, arg=Ops.MAX)
+  dead = min_pc.eq(_ci(0x7FFFFFFF)) & any_undone.ne(_ci(0))
+  pick_div = UOp.group(st_cur.after(loop, g_div).index(0).store(min_pc),
+                       st_go.after(loop, g_div).index(0).store((min_pc < _ci(0x7FFFFFFF)).cast(U8)),
+                       err.after(loop, g_div).index(0).store(dead.where(_ci(9), err.after(loop, g_div).index(0).load()))).end(g_div)
+  g_uni = UOp.range(is_uni.cast(I32), ax())
+  picked = UOp.group(pick_div, st_cur.after(loop, g_uni).index(0).store(uni).end(g_uni))
 
-def blend(active:UOp, new:UOp, old:UOp) -> UOp: # bitwise, since a where becomes a masked store, which is microcoded on x86
-  keep = active.cast(new.dtype) * new.dtype.max
-  return (new & keep) | (old & (keep ^ new.dtype.max))
+  go_now = st_go.after(picked).index(0).load().ne(_c(0, U8)) & err.after(picked).index(0).load().eq(_ci(0))
+  cur = st_cur.after(picked).index(0).load()
+  rec = [prog.after(picked).index((cur * _ci(REC_LEN) + _ci(j)).valid(go_now)).load() for j in range(REC_LEN)]
+  kind, op, dst, iters, flags, s_meta, s_val = rec[0], rec[1], rec[2].cast(I32), rec[3].cast(I32), rec[4], rec[5:8], rec[8:11]
 
-def ftz_f32(f:UOp) -> UOp:
-  u = f.bitcast(dtypes.uint32)
-  return ((u & (SIGN - 1)) < TINY).where(u & SIGN, u).bitcast(dtypes.float32)
+  def lane_active(lane:UOp, dep:UOp) -> UOp:
+    return is_uni.where(_c(True, dtypes.bool), st_pc.after(dep).index(lane).load().eq(cur) & st_done.after(dep).index(lane).load().eq(_c(0, U8)))
+  def set_err(dep:UOp, cond:UOp, code:int) -> UOp:
+    e0 = err.after(dep).index(0).load()
+    do_set = cond & e0.eq(_ci(0))
+    return UOp.group(err.after(dep).index(0).store(do_set.where(_ci(code), e0)),
+                     err.after(dep).index(1).store(do_set.where(cur, err.after(dep).index(1).load())))
+  def write_reg(dep:UOp, lane:UOp, active:UOp, reg:UOp, dst_half:UOp, val_u32:UOp) -> UOp:
+    use_h, idx = dst_half.ne(_c(0)) & (reg < _ci(A0)), reg.clamp(0, NREGS - 1) * n_local + lane
+    return UOp.group(h_buf.after(dep).index(idx.valid(active & use_h)).store((val_u32 & _c(0xFFFF)).cast(U16)),
+                     r_buf.after(dep).index(idx.valid(active & _not(use_h))).store(val_u32))
+  def commit_tmp(dep:UOp, reg:UOp, dst_half:UOp) -> UOp:
+    use_h, base_r = dst_half.ne(_c(0)) & (reg < _ci(A0)), reg.clamp(0, NREGS - 1) * n_local
+    g_ur, l_ur = UOp.range((is_uni & _not(use_h)).cast(I32), ax()), UOp.range(n_local, ax())
+    g_uh, l_uh = UOp.range((is_uni & use_h).cast(I32), ax()), UOp.range(n_local, ax())
+    g_dv, l_dv = UOp.range(_not(is_uni).cast(I32), ax()), UOp.range(n_local, ax())
+    return UOp.group(
+      r_buf.after(dep, g_ur).index(base_r + l_ur).store(tmp.after(dep, g_ur).index(l_ur).load()).end(l_ur).end(g_ur),
+      h_buf.after(dep, g_uh).index(base_r + l_uh).store((tmp.after(dep, g_uh).index(l_uh).load() & _c(0xFFFF)).cast(U16)).end(l_uh).end(g_uh),
+      write_reg(UOp.group(dep, g_dv), l_dv, lane_active(l_dv, g_dv), reg, dst_half, tmp.after(dep, g_dv).index(l_dv).load()).end(l_dv).end(g_dv))
 
-def canonical_nan_f32(f:UOp) -> UOp:
-  u = f.bitcast(dtypes.uint32)
-  return ((u & (SIGN - 1)) > INF).where(u.const_like(NAN), u)
+  # Resolve a source ONCE before `for (lane)` into (dep, (base_row, and_mask, xor_mask)); handles r/c/c</i/demote/half>=A0
+  def prep_src(dep:UOp, slot:int, meta:UOp, val:UOp, k:UOp, is_float:bool, half:bool, bw_neg:UOp|None=None,
+               demote_f16:UOp|bool|None=None) -> tuple[UOp, tuple[UOp, UOp, UOp]]:
+    udt = U16 if half else U32
+    full_m, sign_m, abs_m = _c(0xFFFF if half else 0xFFFFFFFF, udt), _c(0x8000 if half else 0x80000000, udt), _c(0x7FFF if half else 0x7FFFFFFF, udt)
+    sk = meta & _c(7)
+    r_inc = ((meta >> _c(6)) & _c(1)).cast(I32) * k
+    reg, c_idx = (val.cast(I32) + r_inc).clamp(0, NREGS - 1), (val.cast(I32) + r_inc).clamp(0, 8191)
+    c_full = consts.after(dep).index(c_idx.clamp(0, 4095)).load()
+    if half:
+      cw = consts.after(dep).index((c_idx >> _ci(1)).clamp(0, 4095)).load()
+      df16 = is_float if demote_f16 is None else demote_f16
+      c_f16 = c_full.bitcast(F32).cast(F16).bitcast(U16).cast(U32) if df16 is True else \
+              (c_full & _c(0xFFFF)) if df16 is False else df16.where(c_full.bitcast(F32).cast(F16).bitcast(U16).cast(U32), c_full & _c(0xFFFF))
+      vc = demote.ne(_ci(0)).where(c_f16, (cw >> ((c_idx & _ci(1)).cast(U32) * _c(16))) & _c(0xFFFF))
+    else: vc = c_full
+    need_rel, need_r2h = sk.eq(_c(3)), _c(half, dtypes.bool) & sk.eq(_c(1)) & (reg >= _ci(A0))
+    g_sp, l_sp = UOp.range((need_rel | need_r2h).cast(I32), ax()), UOp.range(n_local, ax())
+    rel_idx = r_buf.after(dep, g_sp).index(_ci(A0) * n_local + l_sp).load().bitcast(I32) + val.bitcast(I32)
+    rel_oob = lane_active(l_sp, UOp.group(dep, g_sp)) & need_rel & ((rel_idx < _ci(0)) | (rel_idx >= _ci(4096)))
+    vrel = consts.after(dep, g_sp).index(rel_idx.clamp(0, 4095)).load()
+    sp_idx = _ci(NREGS + slot) * n_local + l_sp
+    sp_val = need_rel.where(vrel, r_buf.after(dep, g_sp).index(reg * n_local + l_sp).load())
+    sp_st = h_buf.after(dep, g_sp).index(sp_idx).store((sp_val & _c(0xFFFF)).cast(U16)) if half else r_buf.after(dep, g_sp).index(sp_idx).store(vrel)
+    sp = UOp.group(sp_st, set_err(UOp.group(dep, g_sp), rel_oob, 2)).end(l_sp).end(g_sp)
+    is_reg = sk.eq(_c(1)) | need_rel
+    row = (need_rel | need_r2h).where(_ci(NREGS + slot), sk.eq(_c(1)).where(reg, _ci(0)))
+    abs_b, neg_b = ((meta >> _c(5)) & _c(1)).ne(_c(0)), ((meta >> _c(4)) & _c(1)).ne(_c(0))
+    m_mod, x_mod = (abs_b.where(abs_m, full_m), neg_b.where(sign_m, _c(0, udt))) if is_float else \
+                   (full_m, (neg_b & bw_neg.ne(_c(0))).where(full_m, _c(0, udt))) if bw_neg is not None else (full_m, _c(0, udt))
+    sv = (sk.eq(_c(2)).where(vc, val).cast(udt) & m_mod) ^ x_mod
+    return sp, (row * n_local, is_reg.where(m_mod, _c(0, udt)), is_reg.where(x_mod, sv))
 
-FMAD, IMAD, SHL, SHR, ASHR, AND, OR, XOR, SEL = range(9)
-FLOAT_OPS, INT_OPS = (FMAD,), (IMAD, SHL, SHR, ASHR, AND, OR, XOR, SEL)
-ONE_F, NEG_ZERO, ONE, ZERO = (Src("i", v) for v in (f32_bits(1.0), SIGN, 1, 0))
-NEG_ONE = ALL_ONES = Src("i", U32)
-LO, HI = 2**16 - 1, U32 ^ (2**16 - 1)
-# add, mul and mov become a * b + c with a constant operand: x * 1, x + -0.0 and x * -1 + y keep the exact bits
-# kind says how a source's abs/neg modifiers apply: f flips float sign bits, b is a bitwise not, u and i have none
-BLOCK_OPS:dict[int, tuple[int, str, tuple]] = {
-  mesa.OPC_MAD_F32: (FMAD, "f", (0, 1, 2)), mesa.OPC_ADD_F: (FMAD, "f", (0, ONE_F, 1)), mesa.OPC_MUL_F: (FMAD, "f", (0, 1, NEG_ZERO)),
-  mesa.OPC_MOV: (IMAD, "u", (0, ONE, ZERO)), mesa.OPC_ADD_U: (IMAD, "u", (0, ONE, 1)), mesa.OPC_ADD_S: (IMAD, "i", (0, ONE, 1)),
-  mesa.OPC_SUB_U: (IMAD, "u", (1, NEG_ONE, 0)), mesa.OPC_MULL_U: (IMAD, "u", ((0, LO), (1, LO), ZERO)),
-  mesa.OPC_MADSH_M16: (IMAD, "u", ((0, LO), (1, HI), 2)), mesa.OPC_SHL_B: (SHL, "u", (0, 1, ZERO)), mesa.OPC_SHR_B: (SHR, "u", (0, 1, ZERO)),
-  mesa.OPC_ASHR_B: (ASHR, "i", (0, 1, ZERO)), mesa.OPC_AND_B: (AND, "b", (0, 1, ZERO)), mesa.OPC_OR_B: (OR, "b", (0, 1, ZERO)),
-  mesa.OPC_XOR_B: (XOR, "b", (0, 1, ZERO)), mesa.OPC_NOT_B: (XOR, "b", (0, ALL_ONES, ZERO)), mesa.OPC_SEL_B32: (SEL, "u", (0, 1, 2))}
+  def prep_3(dep:UOp, k:UOp, is_float:bool, half:bool, bw_neg:UOp|None=None) -> tuple[UOp, list[tuple[UOp, UOp, UOp]]]:
+    ps = [prep_src(dep, j, s_meta[j], s_val[j], k, is_float, half, bw_neg) for j in range(3)]
+    return UOp.group(*[p[0] for p in ps]), [p[1] for p in ps]
+  def ld_src(buf:UOp, sp:UOp, lane:UOp, spec:tuple[UOp, UOp, UOp]) -> UOp:
+    return (buf.after(sp).index(spec[0] + lane).load() & spec[1]) ^ spec[2]
+  def _fconv(fv:UOp, half:bool, dst_half:UOp) -> UOp:
+    return dst_half.ne(_c(0)).where(fv.bitcast(U16).cast(U32), fv.cast(F32).bitcast(U32)) if half else \
+           dst_half.ne(_c(0)).where(_cov_to_float(fv.cast(F64), True, _c(0)).bitcast(U16).cast(U32), fv.bitcast(U32))
+  def _ialu_25(au:UOp, bu:UOp, cu:UOp, bits:int, udt:DType, sdt:DType) -> list[UOp]:
+    ai, bi, all1 = au.bitcast(sdt), bu.bitcast(sdt), _c(0xFFFF if bits == 16 else 0xFFFFFFFF, udt)
+    sh, sha = bu & _c(bits - 1, udt), au & _c(bits - 1, udt)
+    a32, b32, c32 = au.cast(U32), bu.cast(U32), cu.cast(U32)
+    ms24 = (((a32 & _c(0xFFFFFF)) ^ _c(0x800000)) - _c(0x800000)) * (((b32 & _c(0xFFFFFF)) ^ _c(0x800000)) - _c(0x800000))
+    return [
+      (au + bu).cast(U32), (au + bu).cast(U32), (au - bu).cast(U32), (au - bu).cast(U32),
+      (au & bu).cast(U32), (au | bu).cast(U32), (au ^ bu).cast(U32), (au ^ all1).cast(U32),
+      (au << sh).cast(U32), (au >> sh).cast(U32), (ai >> sh.bitcast(sdt)).bitcast(udt).cast(U32), ((au >> sh) & _c(1, udt)).cast(U32),
+      ms24, (a32 & _c(0xFFFFFF)) * (b32 & _c(0xFFFFFF)), (a32 & _c(0xFFFF)) * (b32 & _c(0xFFFF)),
+      (((a32 & _c(0xFFFF)) * (b32 >> _c(16))) << _c(16)) + c32, ((a32 & _c(0xFFFF)) * (b32 & _c(0xFFFF))) + c32, ms24 + c32,
+      bu.ne(_c(0, udt)).where(au, cu).cast(U32), (bi >= _c(0, sdt)).where(au, cu).cast(U32),
+      ((bu >> sha) & cu).cast(U32), ((bu >> sha) | cu).cast(U32), ((bu << sha) | cu).cast(U32),
+      ((bu << sha) & cu).cast(U32), ((bu & au) | cu).cast(U32)]
 
-def block_source(spec:int|Src|tuple, srcs:list[Src], kind:str) -> tuple[int, int, int]|None:
-  idx, mask = spec if isinstance(spec, tuple) else (spec, U32)
-  s = srcs[idx] if isinstance(idx, int) else idx
-  if s.half or s.kind not in ("r", "i") or (s.kind == "r" and s.val >= A0): return None
-  if kind == "f": a, x = SIGN - 1 if s.absneg & 2 else U32, SIGN if s.absneg & 1 else 0
-  elif kind == "b": a, x = U32, U32 if s.absneg & 1 else 0
-  elif s.absneg & (1 if kind == "u" else 3): return None
-  else: a, x = U32, 0
-  if s.kind == "i": return 0, 0, (s.val & a & mask) ^ x
-  return s.val, a & mask, x
+  # 1. K_UNDEF
+  g_und = UOp.range((go_now & kind.eq(_c(K_UNDEF))).cast(I32), ax())
+  s_und = set_err(g_und, _c(True, dtypes.bool), 1).end(g_und)
 
-@functools.cache
-def block_records(i:Inst|NotImplementedError) -> tuple[tuple[int, ...], ...]|None:
-  if not isinstance(i, (Cat1, Cat2, Cat3)) or i.op not in BLOCK_OPS or i.dst + i.iterations > A0: return None
-  if isinstance(i, Cat1) and not (i.src_type == i.dst_type and i.src_type in (1, 3, 5)): return None
-  if isinstance(i, (Cat2, Cat3)) and (i.sat or i.dst_conv or i.dst_half or getattr(i, "ei", 0)): return None
-  op, kind, spec = BLOCK_OPS[i.op]
-  recs = []
-  for k, srcs in enumerate(i.repeat_srcs):
-    sources = [block_source(x, srcs, kind) for x in spec]
-    if None in sources: return None
-    rows, ands, xors = zip(*cast(list[tuple[int, int, int]], sources))
-    recs.append((op, i.dst + k, *rows, *ands, *xors))
-  return tuple(recs)
+  # 2. K_FMAD32 & K_FMAD16 (MAD/ADD/MUL — vectorized SIMD via tmp[])
+  def emit_fmad(k_tag:int, half:bool) -> UOp:
+    fdt, udt, buf = (F16, U16, h_buf) if half else (F32, U32, r_buf)
+    g, k = UOp.range((go_now & kind.eq(_c(k_tag))).cast(I32), ax()), UOp.range(iters, ax())
+    sp, ss = prep_3(UOp.group(g, k), k, True, half)
+    lane = UOp.range(n_local, ax())
+    a, b, c = [_ftz(ld_src(buf, sp, lane, ss[j]).bitcast(fdt), half) for j in range(3)]
+    comp = tmp.after(sp).index(lane).store(_cnan_u(_ftz_u((_ftz(a * b, half) + c).bitcast(udt), half), half).cast(U32)).end(lane)
+    sat, dst_half = (flags >> _c(1)) & _c(1), flags & _c(1)
+    g_p, l_p = UOp.range((sat.ne(_c(0)) | dst_half.ne(_c(int(half)))).cast(I32), ax()), UOp.range(n_local, ax())
+    fv = tmp.after(comp, g_p).index(l_p).load().cast(udt).bitcast(fdt)
+    fv = sat.ne(_c(0)).where(_sat_f(fv, half), fv)
+    post = tmp.after(comp, g_p).index(l_p).store(_fconv(fv, half, dst_half)).end(l_p).end(g_p)
+    return commit_tmp(UOp.group(comp, post), dst + k, dst_half).end(k).end(g)
+  s_fmad = UOp.group(emit_fmad(K_FMAD32, False), emit_fmad(K_FMAD16, True))
 
-@dataclass(frozen=True)
-class AluBlock:
-  end:int
-  records:np.ndarray # RECORD_LEN uint32 per instruction: op, dst, 3 source rows, 3 and masks, 3 xors
-  kernel_ops:tuple[int, ...]
+  # 3. K_FMISC (MIN/MAX/SIGN/ABSNEG/FLOOR/TRUNC/SEL/CMP)
+  def emit_fmisc(half:bool) -> UOp:
+    fdt, udt, buf = (F16, U16, h_buf) if half else (F32, U32, r_buf)
+    g = UOp.range((go_now & kind.eq(_c(K_FMISC)) & ((flags >> _c(9)) & _c(1)).eq(_c(int(half)))).cast(I32), ax())
+    k = UOp.range(iters, ax())
+    sp, ss = prep_3(UOp.group(g, k), k, True, half)
+    lane = UOp.range(n_local, ax())
+    a, b, c = [_ftz(ld_src(buf, sp, lane, ss[j]).bitcast(fdt), half) for j in range(3)]
+    z, one, a64 = _c(0.0, fdt), _c(1.0, fdt), a.cast(F64)
+    tr64 = a64.trunc()
+    sign_f = _isnan(a, half).where(z, (a > z).where(one, (a < z).where(_c(-1.0, fdt), a)))
+    fout = _sel(op, [_fminmax(a, b, half, False), _fminmax(a, b, half, True), sign_f, a,
+                     (a64 < tr64).where(tr64 - _c(1.0, F64), tr64).cast(fdt), tr64.cast(fdt), ((b > z) | b.eq(z)).where(a, c)])
+    fu = _ftz_u(fout.bitcast(udt), half)
+    sat, dst_half = (flags >> _c(1)) & _c(1), flags & _c(1)
+    fc = op.eq(_c(6)).where(fu, _cnan_u(fu, half)).bitcast(fdt)
+    out_f = _fconv(sat.ne(_c(0)).where(_sat_f(fc, half), fc), half, dst_half)
+    cmp_u = _sel((flags >> _c(4)) & _c(7), [a < b, (a < b) | a.eq(b), a > b, (a > b) | a.eq(b), a.eq(b), a.ne(b)]).cast(udt)
+    cmp_u = sat.ne(_c(0)).where(cmp_u ^ _c(1, udt), cmp_u)
+    cmp_u = ((flags >> _c(2)) & _c(1)).ne(_c(0)).where(_c(0, udt) - cmp_u, cmp_u)
+    comp = tmp.after(sp).index(lane).store(op.eq(_c(7)).where(cmp_u.cast(U32), out_f)).end(lane)
+    return commit_tmp(comp, dst + k, dst_half).end(k).end(g)
+  s_fmisc = UOp.group(emit_fmisc(False), emit_fmisc(True))
 
-@functools.cache
-def alu_blocks(image:bytes, entry:int) -> dict[int, AluBlock]:
-  blocks = {}
-  for start, end, insts in straight_runs(decode(image), block_starts(image, entry), lambda i: True if block_records(i) is not None else None):
-    recs = [rec for i in insts for rec in block_records(i) or ()]
-    assert len(recs) < MAX_RECORDS, f"pc {start}: alu block too long"
-    used = {rec[0] for rec in recs}
-    kernel_ops = FLOAT_OPS if used <= set(FLOAT_OPS) else INT_OPS if used <= set(INT_OPS) else FLOAT_OPS + INT_OPS
-    blocks[start] = AluBlock(end, np.array(recs, np.uint32), kernel_ops)
-  return blocks
+  # 4. K_IALU32 (fast 32-bit int/bitwise/shift/mul/mad/sel — vectorized SIMD via tmp[])
+  g_ia, k_ia = UOp.range((go_now & kind.eq(_c(K_IALU32))).cast(I32), ax()), UOp.range(iters, ax())
+  sp_ia, ss_ia = prep_3(UOp.group(g_ia, k_ia), k_ia, False, False, (flags >> _c(8)) & _c(1))
+  l_ia = UOp.range(n_local, ax())
+  a_i, b_i, c_i = [ld_src(r_buf, sp_ia, l_ia, ss_ia[j]) for j in range(3)]
+  s_ialu32 = commit_tmp(tmp.after(sp_ia).index(l_ia).store(_sel(op, _ialu_25(a_i, b_i, c_i, 32, U32, I32))).end(l_ia),
+                        dst + k_ia, _c(0)).end(k_ia).end(g_ia)
 
-@functools.cache
-def alu_kernel(kernel_ops:tuple[int, ...]) -> Callable[..., None]:
-  r, mask, n = lane_params()
-  recs = UOp.param(2, dtypes.uint32, RECORD_LEN * MAX_RECORDS, name="recs")
-  tmp = UOp.param(3, dtypes.uint32, MAX_BLOCK_LANES, name="tmp")
-  count = UOp.variable("count", 1, MAX_RECORDS)
-  k, lane, lane2 = UOp.range(count, 0), UOp.range(n, 1), UOp.range(n, 2)
-  rec = [recs.index(k * RECORD_LEN + j).load() for j in range(RECORD_LEN)]
-  op, dst, rows, ands, xors = rec[0], rec[1], rec[2:5], rec[5:8], rec[8:11]
-  a, b, c = [(r.index(row.cast(dtypes.int32) * n + lane).load() & m) ^ x for row, m, x in zip(rows, ands, xors)]
-  fa, fb, fc = [ftz_f32(x.bitcast(dtypes.float32)) for x in (a, b, c)]
-  amt = b & 31
-  outs = {FMAD: canonical_nan_f32(ftz_f32(ftz_f32(fa * fb) + fc)),
-          IMAD: a * b + c, SHL: a << amt, SHR: a >> amt, ASHR: (a.bitcast(dtypes.int32) >> amt.bitcast(dtypes.int32)).bitcast(dtypes.uint32),
-          AND: a & b, OR: a | b, XOR: a ^ b, SEL: b.ne(0).where(a, c)}
-  out = outs[kernel_ops[0]]
-  for o in kernel_ops[1:]: out = op.eq(o).where(outs[o], out)
-  # through a scratch row: a destination that is also a source (r = a * b + r) would fail clang's overlap check and run scalar
-  computed = tmp.index(lane).store(out).end(lane)
-  reg = r.index(dst.cast(dtypes.int32) * n + lane2)
-  store = reg.store(blend(mask.index(lane2).load(), tmp.after(computed).index(lane2).load(), reg.load()))
-  return cpu_kernel(store.end(lane2).end(k), "qcom_alu_" + "_".join(map(str, kernel_ops)))
+  # 5. K_IMISC (16-bit int ops + sat/ei/cmp/clz/ctz/min/max/absneg/sad/signed-mod)
+  def emit_imisc(half:bool) -> UOp:
+    bits, udt, sdt, buf = (16, U16, dtypes.int16, h_buf) if half else (32, U32, I32, r_buf)
+    all1 = _c(0xFFFF if half else 0xFFFFFFFF, udt)
+    g = UOp.range((go_now & kind.eq(_c(K_IMISC)) & ((flags >> _c(9)) & _c(1)).eq(_c(int(half)))).cast(I32), ax())
+    k = UOp.range(iters, ax())
+    sp, ss = prep_3(UOp.group(g, k), k, False, half)
+    lane = UOp.range(n_local, ax())
+    is_bw, is_s = ((flags >> _c(8)) & _c(1)).ne(_c(0)), ((flags >> _c(10)) & _c(1)).ne(_c(0))
+    def imod(j:int) -> UOp:
+      u = ld_src(buf, sp, lane, ss[j])
+      u = (is_s & ((s_meta[j] >> _c(5)) & _c(1)).ne(_c(0)) & (u.bitcast(sdt) < _c(0, sdt))).where(_c(0, udt) - u, u)
+      return ((s_meta[j] >> _c(4)) & _c(1)).ne(_c(0)).where(is_bw.where(u ^ all1, _c(0, udt) - u), u)
+    au, bu, cu = imod(0), imod(1), imod(2)
+    ai, bi = au.bitcast(sdt), bu.bitcast(sdt)
+    sat, ei = ((flags >> _c(1)) & _c(1)).ne(_c(0)), ((flags >> _c(3)) & _c(1)).ne(_c(0))
+    umax = _c(0xFFFF if half else 0xFFFFFFFF, I64)
+    smin, smax = _c(-32768 if half else -2147483648, I64), _c(32767 if half else 2147483647, I64)
+    add_u = ei.where(((au.cast(U64) + bu.cast(U64)) >> _c(1, U64)).cast(udt),
+            sat.where((au.cast(I64) + bu.cast(I64)).clamp(0, umax).cast(udt), au + bu))
+    sub_u = sat.where((au.cast(I64) - bu.cast(I64)).clamp(0, umax).cast(udt), au - bu)
+    add_s = sat.where((ai.cast(I64) + bi.cast(I64)).clamp(smin, smax).cast(sdt).bitcast(udt), au + bu)
+    sub_s = sat.where((ai.cast(I64) - bi.cast(I64)).clamp(smin, smax).cast(sdt).bitcast(udt), au - bu)
+    cond = (flags >> _c(4)) & _c(7)
+    cu_b = _sel(cond, [au < bu, au <= bu, au > bu, au >= bu, au.eq(bu), au.ne(bu)])
+    cs_b = _sel(cond, [ai < bi, ai <= bi, ai > bi, ai >= bi, ai.eq(bi), ai.ne(bi)])
+    cmp_v = op.eq(_c(35)).where(cs_b, cu_b).cast(udt)
+    cmp_v = sat.where(cmp_v ^ _c(1, udt), cmp_v)
+    cmp_v = ((flags >> _c(2)) & _c(1)).ne(_c(0)).where(_c(0, udt) - cmp_v, cmp_v)
+    out32 = _sel(op, [add_u.cast(U32), add_s.cast(U32), sub_u.cast(U32), sub_s.cast(U32)] + _ialu_25(au, bu, cu, bits, udt, sdt)[4:] + [
+      (au < bu).where(au, bu).cast(U32), (ai < bi).where(au, bu).cast(U32),
+      (au > bu).where(au, bu).cast(U32), (ai > bi).where(au, bu).cast(U32), au.cast(U32),
+      _clz_u(au, bits).cast(U32), _clz_u((ai < _c(0, sdt)).where(au ^ all1, au), bits).cast(U32),
+      _clz_u(au, bits, True).cast(U32), (au + bu + cu).cast(U32), cmp_v.cast(U32), cmp_v.cast(U32)])
+    dst_half = flags & _c(1)
+    if half: out32 = (dst_half.eq(_c(0)) & is_s & op.ne(_c(35))).where(out32.cast(U16).bitcast(dtypes.int16).cast(I32).bitcast(U32), out32)
+    return commit_tmp(tmp.after(sp).index(lane).store(out32).end(lane), dst + k, dst_half).end(k).end(g)
+  s_imisc = UOp.group(emit_imisc(False), emit_imisc(True))
 
-def exec_block(t:Threads, b:AluBlock):
-  tmp = np.empty(t.r.shape[1], np.uint32)
-  alu_kernel(b.kernel_ops)(t.r.ctypes.data, t.mask.ctypes.data, b.records.ctypes.data, tmp.ctypes.data, n=len(tmp), count=len(b.records))
+  # 6. K_SFU (Cat4 — shared f64 prologue/epilogue, each transcendental in its own gate)
+  g_sfu, k_sfu = UOp.range((go_now & kind.eq(_c(K_SFU))).cast(I32), ax()), UOp.range(iters, ax())
+  dep_sfu, src_hs = UOp.group(g_sfu, k_sfu), ((flags >> _c(2)) & _c(1)).ne(_c(0))
+  g_sf0, g_sf1 = UOp.range(_not(src_hs).cast(I32), ax()), UOp.range(src_hs.cast(I32), ax())
+  spf, sf_f = prep_src(UOp.group(dep_sfu, g_sf0), 0, s_meta[0], s_val[0], k_sfu, True, False)
+  sph, sf_h = prep_src(UOp.group(dep_sfu, g_sf1), 0, s_meta[0], s_val[0], k_sfu, True, True)
+  lf0, lf1 = UOp.range(n_local, ax()), UOp.range(n_local, ax())
+  ld_sfu = UOp.group(tmp_f64.after(spf).index(lf0).store(_ftz(ld_src(r_buf, spf, lf0, sf_f).bitcast(F32), False).cast(F64)).end(lf0).end(g_sf0),
+                     tmp_f64.after(sph).index(lf1).store(_ftz(ld_src(h_buf, sph, lf1, sf_h).bitcast(F16), True).cast(F64)).end(lf1).end(g_sf1))
+  sfu_ops = [lambda x: _c(1.0, F64) / x, lambda x: _c(1.0, F64) / x.sqrt(),
+             lambda x: x.log2(), lambda x: x.exp2(), lambda x: x.sin(), lambda x: x.sqrt()]
+  sfu_eval = []
+  for sop, fn in enumerate(sfu_ops):
+    gs, ls = UOp.range(op.eq(_c(sop)).cast(I32), ax()), UOp.range(n_local, ax())
+    sfu_eval.append(tmp_f64.after(ld_sfu, gs).index(ls).store(fn(tmp_f64.after(ld_sfu, gs).index(ls).load())).end(ls).end(gs))
+  ev_sfu = UOp.group(*sfu_eval)
+  l_se = UOp.range(n_local, ax())
+  y32 = tmp_f64.after(ev_sfu).index(l_se).load().cast(F32)
+  sat_s, dst_hs = ((flags >> _c(1)) & _c(1)).ne(_c(0)), flags & _c(1)
+  y16 = _cnan_u(_cov_to_float(y32.cast(F64), True, _c(0)).bitcast(U16), True).bitcast(F16)
+  y32c = _cnan_u(_ftz_u(y32.bitcast(U32), False), False).bitcast(F32)
+  out_sfu = src_hs.where(_fconv(sat_s.where(_sat_f(y16, True), y16), True, dst_hs), _fconv(sat_s.where(_sat_f(y32c, False), y32c), False, dst_hs))
+  s_sfu = commit_tmp(tmp.after(ev_sfu).index(l_se).store(out_sfu).end(l_se), dst + k_sfu, dst_hs).end(k_sfu).end(g_sfu)
 
-TEX_DTYPES = {np.dtype(np.float16): dtypes.half, np.dtype(np.float32): dtypes.float32}
+  # 7. K_MOV (op==0: fast same-type copy; op==1: SWZ; op==2: converting COV)
+  def emit_mov_same(half:bool) -> UOp:
+    buf = h_buf if half else r_buf
+    g = UOp.range((go_now & kind.eq(_c(K_MOV)) & op.eq(_c(0)) & (flags & _c(1)).eq(_c(int(half)))).cast(I32), ax())
+    k, l_ms = UOp.range(iters, ax()), UOp.range(n_local, ax())
+    sp, spec = prep_src(UOp.group(g, k), 0, s_meta[0], s_val[0], k, False, half, demote_f16=((flags >> _c(4)) & _c(7)).eq(_c(0)))
+    return commit_tmp(tmp.after(sp).index(l_ms).store(ld_src(buf, sp, l_ms, spec).cast(U32)).end(l_ms), dst + k, _c(int(half))).end(k).end(g)
 
-@functools.cache
-def wrmask_channels(wrmask:int) -> np.ndarray: return np.array([c for c in range(4) if wrmask >> c & 1], np.int32)
+  def emit_swz(half:bool) -> UOp:
+    buf = h_buf if half else r_buf
+    g = UOp.range((go_now & kind.eq(_c(K_MOV)) & op.eq(_c(1)) & ((s_meta[0] >> _c(3)) & _c(1)).eq(_c(int(half)))).cast(I32), ax())
+    sp0, s0 = prep_src(g, 0, s_meta[0], s_val[0], _ci(0), False, half)
+    sp1, s1 = prep_src(g, 1, s_meta[1], s_val[1], _ci(0), False, half)
+    sp, l_s = UOp.group(sp0, sp1), UOp.range(n_local, ax())
+    v0, v1 = ld_src(buf, sp, l_s, s0).cast(U32), ld_src(buf, sp, l_s, s1).cast(U32)
+    rd, act = UOp.group(v0, v1), lane_active(l_s, sp)
+    return UOp.group(write_reg(rd, l_s, act, dst, flags & _c(1), v0),
+                     write_reg(rd, l_s, act, s_val[2].cast(I32), flags & _c(1), v1)).end(l_s).end(g)
 
-@dataclass(frozen=True)
-class IsamRun:
-  end:int
-  insts:tuple[Cat5, ...]
+  g_cov, k_m = UOp.range((go_now & kind.eq(_c(K_MOV)) & op.eq(_c(2))).cast(I32), ax()), UOp.range(iters, ax())
+  dep_m = UOp.group(g_cov, k_m)
+  src_t, dst_t, even_m = (flags >> _c(4)) & _c(7), (flags >> _c(8)) & _c(7), (flags >> _c(2)) & _c(1)
+  src_hm = src_t.eq(_c(0)) | src_t.eq(_c(2)) | src_t.eq(_c(4)) | src_t.eq(_c(6)) | src_t.eq(_c(7))
+  g_m0, g_m1 = UOp.range(_not(src_hm).cast(I32), ax()), UOp.range(src_hm.cast(I32), ax())
+  spm_f, sm_f = prep_src(UOp.group(dep_m, g_m0), 0, s_meta[0], s_val[0], k_m, False, False)
+  spm_h, sm_h = prep_src(UOp.group(dep_m, g_m1), 0, s_meta[0], s_val[0], k_m, False, True, demote_f16=src_t.eq(_c(0)))
+  lm0, lm1 = UOp.range(n_local, ax()), UOp.range(n_local, ax())
+  ld_cov = UOp.group(tmp.after(spm_f).index(lm0).store(ld_src(r_buf, spm_f, lm0, sm_f)).end(lm0).end(g_m0),
+                     tmp.after(spm_h).index(lm1).store(ld_src(h_buf, spm_h, lm1, sm_h).cast(U32)).end(lm1).end(g_m1))
+  l_m = UOp.range(n_local, ax())
+  raw_m = tmp.after(ld_cov).index(l_m).load()
+  # cov from u1 (6) and i1 (7) both sign-extend from int8
+  s_f64 = _sel(src_t, [raw_m.cast(U16).bitcast(F16).cast(F64), raw_m.bitcast(F32).cast(F64), (raw_m & _c(0xFFFF)).cast(F64), raw_m.cast(F64),
+                       raw_m.cast(U16).bitcast(dtypes.int16).cast(F64), raw_m.bitcast(I32).cast(F64), raw_m.cast(U8).bitcast(dtypes.int8).cast(F64)])
+  s_i64 = _sel(src_t, [_c(0, I64), _c(0, I64), (raw_m & _c(0xFFFF)).cast(I64), raw_m.cast(I64),
+                       raw_m.cast(U16).bitcast(dtypes.int16).cast(I64), raw_m.bitcast(I32).cast(I64), raw_m.cast(U8).bitcast(dtypes.int8).cast(I64)])
+  f_clean = s_f64.ne(s_f64).where(_c(0.0, F64), s_f64)
+  dmin = _sel(dst_t, [_c(v, F64) for v in (0.0, 0.0, 0.0, 0.0, -32768.0, -2147483648.0, 0.0, -128.0)])
+  dmax = _sel(dst_t, [_c(v, F64) for v in (0.0, 0.0, 65535.0, 4294967295.0, 32767.0, 2147483647.0, 255.0, 127.0)])
+  f_cl = (f_clean < dmin).where(dmin, (f_clean > dmax).where(dmax, f_clean.trunc()))
+  f2i = dst_t.eq(_c(3)).where(f_cl.cast(U32), f_cl.cast(I64).cast(U32))
+  to_f = dst_t.eq(_c(0)).where(_cov_to_float(s_f64, True, even_m).bitcast(U16).cast(U32), _cov_to_float(s_f64, False, even_m).bitcast(U32))
+  out_m = src_t.eq(dst_t).where(raw_m, (dst_t < _c(2)).where(to_f, (src_t < _c(2)).where(f2i, s_i64.cast(U32))))
+  out_m = dst_t.eq(_c(6)).where(out_m & _c(0xFF), dst_t.eq(_c(7)).where(out_m.cast(U8).bitcast(dtypes.int8).cast(U16).cast(U32), out_m))
+  s_cov = commit_tmp(tmp.after(ld_cov).index(l_m).store(out_m).end(l_m), dst + k_m, flags & _c(1)).end(k_m).end(g_cov)
+  s_mov = UOp.group(emit_mov_same(False), emit_mov_same(True), emit_swz(False), emit_swz(True), s_cov)
 
-@functools.cache
-def isam_runs(image:bytes, entry:int) -> dict[int, IsamRun]:
-  def key(i) -> tuple|None: return (i.tex, i.samp, i.type, i.wrmask) if isinstance(i, Cat5) and not i.s2en else None
-  runs = {}
-  for start, end, insts in straight_runs(decode(image), block_starts(image, entry), key):
-    assert len(insts) < MAX_RECORDS, f"pc {start}: isam run too long"
-    if len(insts) > 1: runs[start] = IsamRun(end, tuple(insts))
-  return runs
+  # 8. K_MEM (Cat6 LDG/STG/LDL/STL/LDP/STP)
+  g_mem, l_mem = UOp.range((go_now & kind.eq(_c(K_MEM))).cast(I32), ax()), UOp.range(n_local, ax())
+  act_mem, m_type, m_half = lane_active(l_mem, g_mem), (flags >> _c(4)) & _c(7), flags & _c(1)
+  esz = (m_type >= _c(6)).where(_ci(1), (m_type.eq(_c(0)) | m_type.eq(_c(2)) | m_type.eq(_c(4))).where(_ci(2), _ci(4)))
+  areg, moff = s_val[0].cast(I32).clamp(0, NREGS - 1), s_val[1].bitcast(I32)
+  g_hi = r_buf.after(g_mem).index((areg + _ci(1)).clamp(0, NREGS - 1) * n_local + l_mem).load().cast(U64) << _c(32, U64)
+  gaddr = (r_buf.after(g_mem).index(areg * n_local + l_mem).load().cast(U64) | g_hi) + moff.cast(I64).bitcast(U64)
+  r_src2, r_sh, r_off = s_val[2].cast(I32).clamp(0, NREGS - 1), ((flags >> _c(8)) & _c(3)).cast(U64), ((flags >> _c(12)) & _c(3)).cast(U64)
+  roff = ((r_buf.after(g_mem).index(r_src2 * n_local + l_mem).load().cast(U64) << r_sh) + r_off) * esz.cast(U64)
+  gaddr = ((flags >> _c(2)) & _c(1)).ne(_c(0)).where(gaddr + roff, gaddr)
+  lp_off = r_buf.after(g_mem).index(areg * n_local + l_mem).load().bitcast(I32) + moff
+  is_g, is_l, is_p, is_ld = op < _c(2), (op.eq(_c(2)) | op.eq(_c(3))), op >= _c(4), (op & _c(1)).eq(_c(0))
+  l_ok, p_ok = (lp_off >= _ci(0)) & (lp_off + esz * iters <= lmem_sz), (lp_off >= _ci(0)) & (lp_off + esz * iters <= pvt_sz)
+  mem_ok = act_mem & is_g.where(_c(True, dtypes.bool), is_l.where(l_ok, p_ok))
+  c_m = UOp.range(iters, ax())
+  c_off = c_m * esz
+  def ld_b(b:int) -> UOp:
+    ok = mem_ok & is_ld & (_ci(b) < esz)
+    gv = vmem.after(g_mem).index((gaddr + (c_off + _ci(b)).cast(U64)).cast(I64).valid(ok & is_g)).load()
+    lv = lmem.after(g_mem).index((lp_off + c_off + _ci(b)).valid(ok & is_l)).load()
+    pv = pvt.after(g_mem).index((l_mem * pvt_sz + lp_off + c_off + _ci(b)).valid(ok & is_p)).load()
+    return ok.where(is_g.where(gv, is_l.where(lv, pv)).cast(U32) << _c(b * 8), _c(0))
+  ld_val = ld_b(0) | ld_b(1) | ld_b(2) | ld_b(3)
+  ld_val = m_type.eq(_c(7)).where(ld_val.cast(U8).bitcast(dtypes.int8).cast(U16).cast(U32), ld_val)
+  st_idx = (dst + c_m).clamp(0, NREGS - 1) * n_local + l_mem
+  st_val = m_half.ne(_c(0)).where(h_buf.after(g_mem).index(st_idx).load().cast(U32), r_buf.after(g_mem).index(st_idx).load())
+  def st_b(b:int) -> UOp:
+    ok, bv = mem_ok & _not(is_ld) & (_ci(b) < esz), ((st_val >> _c(b * 8)) & _c(0xFF)).cast(U8)
+    return UOp.group(vmem.after(g_mem).index((gaddr + (c_off + _ci(b)).cast(U64)).cast(I64).valid(ok & is_g)).store(bv),
+                     lmem.after(g_mem).index((lp_off + c_off + _ci(b)).valid(ok & is_l)).store(bv),
+                     pvt.after(g_mem).index((l_mem * pvt_sz + lp_off + c_off + _ci(b)).valid(ok & is_p)).store(bv))
+  s_mem = UOp.group(write_reg(UOp.group(g_mem, gaddr, lp_off, ld_val), l_mem, act_mem & is_ld, dst + c_m, m_half, ld_val),
+                    *[st_b(b) for b in range(4)], set_err(g_mem, act_mem & is_l & _not(l_ok), 3),
+                    set_err(g_mem, act_mem & op.eq(_c(5)) & _not(p_ok), 4)).end(c_m).end(l_mem).end(g_mem)
 
-@functools.cache
-def isam_kernel(img_dt:np.dtype, dt:np.dtype, wrmask:int) -> Callable[..., None]:
-  r, mask, n = lane_params()
-  bits = dtypes.uint32 if dt == np.float32 else dtypes.uint16
-  img = UOp.param(2, TEX_DTYPES[img_dt], 2**30, name="img")
-  recs = UOp.param(3, dtypes.int32, 2 * MAX_RECORDS, name="recs")
-  tmp = UOp.param(4, bits, 4 * MAX_BLOCK_LANES, name="tmp")
-  out = r if dt == np.float32 else UOp.param(5, bits, NREGS * MAX_BLOCK_LANES, name="half")
-  count = UOp.variable("count", 1, MAX_RECORDS)
-  width, height, pitch = [UOp.variable(v, 0, 2**24) for v in ("width", "height", "pitch")]
-  k, lane, lane2 = UOp.range(count, 0), UOp.range(n, 1), UOp.range(n, 2)
-  src1, dst = recs.index(k * 2).load(), recs.index(k * 2 + 1).load()
-  x, y = r.index(src1 * n + lane).load(), r.index((src1 + 1) * n + lane).load()
-  inside = (x < width.cast(dtypes.uint32)) & (y < height.cast(dtypes.uint32))
-  base = y.cast(dtypes.int32) * pitch + x.cast(dtypes.int32) * 4
-  gathered = []
-  for j, c in enumerate(wrmask_channels(wrmask).tolist()):
-    texel = img.index(inside.where(base + c, 0)).load() # every lane loads, so clamp into the image
-    gathered.append(tmp.index(j * n + lane).store(inside.where(texel, 0).cast(TEX_DTYPES[dt]).bitcast(bits)))
-  done, active = UOp.group(*gathered).end(lane), mask.index(lane2).load()
-  stores = []
-  for j in range(len(gathered)):
-    reg = out.index((dst + j) * n + lane2)
-    stores.append(reg.store(blend(active, tmp.after(done).index(j * n + lane2).load(), reg.load())))
-  return cpu_kernel(UOp.group(*stores).end(lane2).end(k), "qcom_isam")
+  # 9. K_TEX (Cat5 ISAM + Ibo STIB using direct uint16/uint32 loads/stores)
+  g_is = UOp.range((go_now & kind.eq(_c(K_TEX)) & op.eq(_c(0))).cast(I32), ax())
+  tex_hi = (n_tex - _ci(1)).clamp(0, 1023)
+  s2en, tb_s = (flags & _c(1)).ne(_c(0)), s_val[1].cast(I32).clamp(0, tex_hi) * _ci(5)
+  ts_meta = [tex_m.after(g_is).index(tb_s + _ci(j)).load() for j in range(5)]
+  l_is = UOp.range(n_local, ax())
+  act_is = lane_active(l_is, g_is)
+  t_s2 = h_buf.after(g_is).index((s_val[1].cast(I32).clamp(0, NREGS - 1) * n_local + l_is).valid(s2en)).load().cast(I32)
+  t_idx = s2en.where(t_s2, s_val[1].cast(I32))
+  t_oob = act_is & ((t_idx < _ci(0)) | (t_idx >= n_tex))
+  tb_d = t_idx.clamp(0, tex_hi) * _ci(5)
+  t_addr, t_w, t_h, t_pitch, t_f16 = [s2en.where(tex_m.after(g_is).index((tb_d + _ci(j)).valid(s2en)).load(), ts_meta[j]) for j in range(5)]
+  tx = r_buf.after(g_is).index(s_val[0].cast(I32).clamp(0, NREGS - 1) * n_local + l_is).load().cast(U64)
+  ty = r_buf.after(g_is).index((s_val[0].cast(I32) + _ci(1)).clamp(0, NREGS - 1) * n_local + l_is).load().cast(U64)
+  t_ok, t_eb = act_is & _not(t_oob) & (tx < t_w) & (ty < t_h), ty * t_pitch + tx * _c(4, U64)
+  is_dst_f16, is_i16 = ((flags >> _c(4)) & _c(7)).eq(_c(0)), t_f16.ne(_c(0, U64))
+  t_vals = []
+  for ch in range(4):
+    has_ch = ((iters.cast(U32) >> _c(ch)) & _c(1)).ne(_c(0))
+    ok_ch, eb = t_ok & has_ch, t_eb + _c(ch, U64)
+    u16 = vmem16.after(g_is).index(((t_addr >> _c(1, U64)) + eb).cast(I64).valid(ok_ch & is_i16)).load()
+    u32 = vmem32.after(g_is).index(((t_addr >> _c(2, U64)) + eb).cast(I64).valid(ok_ch & _not(is_i16))).load()
+    fv = ok_ch.where(is_i16.where(u16.bitcast(F16).cast(F32), u32.bitcast(F32)), _c(0.0, F32))
+    t_vals.append((has_ch, is_dst_f16.where(fv.cast(F16).bitcast(U16).cast(U32), fv.bitcast(U32))))
+  rd_is = UOp.group(*[v for _, v in t_vals])
+  s_is = UOp.group(set_err(g_is, t_oob, 5), *[
+    write_reg(rd_is, l_is, act_is & hc & _not(t_oob),
+              dst + sum(((iters >> _ci(p)) & _ci(1) for p in range(ch)), _ci(0)), is_dst_f16.cast(U32), oc)
+    for ch, (hc, oc) in enumerate(t_vals)]).end(l_is).end(g_is)
 
-EXEC:dict[type, Callable] = {Cat1: exec_mov, Cat2: exec_alu, Cat3: exec_alu, Cat4: exec_alu, Cat5: exec_isam, Ibo: exec_ibo, Ldg: exec_mem,
-                             Stg: exec_mem, Load: exec_mem, Store: exec_mem}
+  g_ib = UOp.range((go_now & kind.eq(_c(K_TEX)) & op.eq(_c(1))).cast(I32), ax())
+  ibb = dst.clamp(0, (n_ibo - _ci(1)).clamp(0, 1023)) * _ci(5)
+  i_addr, i_w, i_h, i_pitch, i_f16 = [ibo_m.after(g_ib).index(ibb + _ci(j)).load() for j in range(5)]
+  l_ib, c_ib = UOp.range(n_local, ax()), UOp.range(iters, ax())
+  act_ib = lane_active(l_ib, g_ib)
+  ib_oob = act_ib & ((dst < _ci(0)) | (dst >= n_ibo))
+  ix = r_buf.after(g_ib).index(s_val[0].cast(I32).clamp(0, NREGS - 1) * n_local + l_ib).load().cast(U64)
+  iy = r_buf.after(g_ib).index((s_val[0].cast(I32) + _ci(1)).clamp(0, NREGS - 1) * n_local + l_ib).load().cast(U64)
+  ib_ok, is_img_f16 = act_ib & _not(ib_oob) & (ix < i_w) & (iy < i_h), i_f16.ne(_c(0, U64))
+  vreg = (s_val[1].cast(I32) + c_ib).clamp(0, NREGS - 1) * n_local + l_ib
+  vf_h, vf_f = h_buf.after(g_ib).index(vreg).load().bitcast(F16).cast(F32), r_buf.after(g_ib).index(vreg).load().bitcast(F32)
+  vf = ((flags >> _c(4)) & _c(7)).eq(_c(0)).where(vf_h, vf_f)
+  ieb = iy * i_pitch + ix * _c(4, U64) + c_ib.cast(U64)
+  s_ib = UOp.group(
+    vmem16.after(g_ib).index(((i_addr >> _c(1, U64)) + ieb).cast(I64).valid(ib_ok & is_img_f16)).store(vf.cast(F16).bitcast(U16)),
+    vmem32.after(g_ib).index(((i_addr >> _c(2, U64)) + ieb).cast(I64).valid(ib_ok & _not(is_img_f16))).store(vf.bitcast(U32)),
+    set_err(g_ib, ib_oob, 6)).end(c_ib).end(l_ib).end(g_ib)
+
+  exec_done = UOp.group(s_und, s_fmad, s_fmisc, s_ialu32, s_imisc, s_sfu, s_mov, s_mem, s_is, s_ib)
+
+  # Advance PC for non-CTRL instructions + K_CTRL (NOP/END/JUMP/BR/BRAO/BRAA/PREDT/PREDF/CALL/RET/BAR)
+  is_non_ctrl, is_ctrl = go_now & kind.ne(_c(K_CTRL)) & kind.ne(_c(K_UNDEF)), go_now & kind.eq(_c(K_CTRL))
+  g_adv_u = UOp.range((is_non_ctrl & is_uni).cast(I32), ax())
+  g_adv_d, l_ad = UOp.range((is_non_ctrl & _not(is_uni)).cast(I32), ax()), UOp.range(n_local, ax())
+  g_unop = UOp.range((is_ctrl & is_uni & op.eq(_c(0))).cast(I32), ax())
+  g_cf = UOp.range((is_ctrl & _not(is_uni & op.eq(_c(0)))).cast(I32), ax())
+  l_bar, l_cf = UOp.range(n_local, ax()), UOp.range(n_local, ax())
+  bar_other = (_not(is_uni) & st_done.after(exec_done, g_cf).index(l_bar).load().eq(_c(0, U8)) &
+               st_pc.after(exec_done, g_cf).index(l_bar).load().ne(cur)).cast(I32).reduce(l_bar, arg=Ops.MAX)
+  dep_cf = UOp.group(exec_done, g_cf, bar_other)
+  act_cf, dep_l = lane_active(l_cf, dep_cf), st_dep.after(dep_cf).index(l_cf).load()
+  c1 = r_buf.after(dep_cf).index((_ci(P0) + (iters & _ci(3))) * n_local + l_cf).load().ne(_c(0)) ^ (flags & _c(1)).ne(_c(0))
+  p2_reg = _ci(P0) + ((flags >> _c(4)) & _c(3)).cast(I32)
+  c2 = r_buf.after(dep_cf).index(p2_reg * n_local + l_cf).load().ne(_c(0)) ^ ((flags >> _c(1)) & _c(1)).ne(_c(0))
+  p0_nz = r_buf.after(dep_cf).index(_ci(P0) * n_local + l_cf).load().ne(_c(0))
+  br_go = _sel(op, [_c(False, dtypes.bool), _c(False, dtypes.bool), _c(True, dtypes.bool), c1, c1 | c2, c1 & c2, _not(p0_nz), p0_nz])
+  nxt_pc = cur + _ci(1)
+  ret_pc = st_calls.after(dep_cf).index(((dep_l - _ci(1)).clamp(0, 15)) * n_local + l_cf).load()
+  new_pc = ((op >= _c(2)) & (op <= _c(7))).where(br_go.where(dst, nxt_pc), op.eq(_c(8)).where(dst, op.eq(_c(9)).where(ret_pc,
+           op.eq(_c(10)).where(bar_other.ne(_ci(0)).where(cur, nxt_pc), nxt_pc))))
+  call_ovf, ret_udf = act_cf & op.eq(_c(8)) & (dep_l >= _ci(16)), act_cf & op.eq(_c(9)) & (dep_l <= _ci(0))
+  s_cf_lanes = UOp.group(
+    st_pc.after(dep_cf).index(l_cf.valid(act_cf)).store(new_pc),
+    st_done.after(dep_cf).index(l_cf.valid(act_cf)).store(op.eq(_c(1)).where(_c(1, U8), st_done.after(dep_cf).index(l_cf).load())),
+    st_blk.after(dep_cf).index(l_cf.valid(act_cf)).store(op.eq(_c(10)).where(bar_other.ne(_ci(0)).cast(U8), st_blk.after(dep_cf).index(l_cf).load())),
+    st_dep.after(dep_cf).index(l_cf.valid(act_cf)).store(op.eq(_c(8)).where(dep_l + _ci(1), op.eq(_c(9)).where(dep_l - _ci(1), dep_l))),
+    st_calls.after(dep_cf).index((dep_l.clamp(0, 15) * n_local + l_cf).valid(act_cf & op.eq(_c(8)) & _not(call_ovf))).store(nxt_pc),
+    set_err(dep_cf, call_ovf, 7), set_err(dep_cf, ret_udf, 8)).end(l_cf)
+  l_rc, pc0 = UOp.range(n_local, ax()), st_pc.after(s_cf_lanes).index(0).load()
+  any_diff = (st_done.after(s_cf_lanes).index(l_rc).load().ne(_c(0, U8)) | st_blk.after(s_cf_lanes).index(l_rc).load().ne(_c(0, U8)) |
+              st_pc.after(s_cf_lanes).index(l_rc).load().ne(pc0)).cast(I32).reduce(l_rc, arg=Ops.MAX)
+  any_left = st_done.after(s_cf_lanes).index(l_rc).load().eq(_c(0, U8)).cast(I32).reduce(l_rc, arg=Ops.MAX)
+  step = UOp.group(
+    st_uni.after(exec_done, g_adv_u).index(0).store(nxt_pc).end(g_adv_u),
+    st_pc.after(exec_done, g_adv_d).index(l_ad.valid(lane_active(l_ad, g_adv_d))).store(nxt_pc).end(l_ad).end(g_adv_d),
+    st_uni.after(exec_done, g_unop).index(0).store(nxt_pc).end(g_unop),
+    UOp.group(st_uni.after(s_cf_lanes).index(0).store(any_diff.eq(_ci(0)).where(pc0, _ci(-1))),
+              st_go.after(s_cf_lanes).index(0).store(any_left.cast(U8))).end(g_cf))
+  wg_done = step.backedge(loop, st_go.after(step).index(0).load().ne(_c(0, U8)) & err.after(step).index(0).load().eq(_ci(0))).end(wg)
+
+  with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", TRANSCENDENTAL=1, CAPTURE_PROCESS_REPLAY=0):
+    prg = to_program(UOp.sink(wg_done, arg=KernelInfo(name="qcom_a630_vm")), Device["CPU"].renderer)
+  rt, slots = get_runtime("CPU", prg), [p.arg.slot for p in prg.kernel_params]
+  return lambda *bufs: rt(*[bufs[s] for s in slots])
+
+def _pack_images(imgs:list[Image]) -> np.ndarray:
+  if not imgs: return np.zeros(5, np.uint64)
+  return np.array([[i.addr, i.width, i.height, i.pitch // i.dtype.itemsize, int(i.dtype == np.float16)] for i in imgs], np.uint64).reshape(-1)
 
 def run(d:Dispatch):
   n_local, n_groups = math.prod(d.local_size), math.prod(d.groups)
-  tid = np.arange(n_local * n_groups)
-  lid, gid = tid % n_local, tid // n_local
-  prog = decode(d.image)
-  blocks:dict[int, AluBlock|IsamRun] = {**isam_runs(d.image, d.entry), **alu_blocks(d.image, d.entry)}
-  t = Threads(d, len(tid))
-  ops = {i.op for i in prog if isinstance(i, (Load, Store))}
-  if ops & {mesa.OPC_LDL, mesa.OPC_STL}:
-    t.mems[mesa.OPC_LDL] = t.mems[mesa.OPC_STL] = (np.zeros(n_groups * d.lmem_size, np.uint8), gid * d.lmem_size, d.lmem_size)
-  if ops & {mesa.OPC_LDP, mesa.OPC_STP}:
-    t.mems[mesa.OPC_LDP] = t.mems[mesa.OPC_STP] = (np.zeros(len(tid) * d.pvt_size, np.uint8), tid * d.pvt_size, d.pvt_size)
-  for reg, v, dims in [(d.localid_reg, lid, d.local_size), (d.wgid_reg, gid, d.groups)]:
-    if reg != 0xfc: t.r[reg], t.r[reg + 1], t.r[reg + 2] = v % dims[0], (v // dims[0]) % dims[1], v // (dims[0] * dims[1])
-  pc, done, blocked = np.zeros(len(tid), np.int64), np.zeros(len(tid), bool), np.zeros(len(tid), bool)
-  calls, depth = np.zeros((16, len(tid)), np.int64), np.zeros(len(tid), np.int64)
-  together:int|None = d.entry
-  with np.errstate(all="ignore"):
-    while not done.all():
-      if together is not None: cur, t.mask = together, t.everyone
-      else:
-        if not (live := ~done & ~blocked).any(): raise RuntimeError("every thread is waiting at a bar")
-        cur = int(pc[live].min()) # lowest pc first, so paths reconverge and nobody passes a bar early
-        t.mask = (pc == cur) & ~done
-      if isinstance(i := prog[cur], NotImplementedError): raise i
-      nxt:int|None = None
-      if (b := blocks.get(cur)) is not None:
-        if isinstance(b, AluBlock): exec_block(t, b)
-        else: exec_isams(t, b.insts)
-        nxt = b.end
-      elif (fn := EXEC.get(type(i))) is not None:
-        for k in range(i.iterations): fn(t, i, k)
-        nxt = cur + 1
-      elif together is not None and is_nop(i): nxt = cur + 1
-      elif together is not None and isinstance(i, Cat0) and i.op in BRANCHES and ((go := taken(t, i)).all() or not go.any()):
-        nxt = i.target if go.all() else cur + 1
-      if nxt is not None:
-        if together is not None: together = nxt
-        else: pc[t.mask] = nxt
-        continue
-      if together is not None: pc[:], together = cur, None
-      pc[t.mask] = cur + 1
-      if isinstance(i, Cat7) and i.op == mesa.OPC_BAR:
-        waiting = np.zeros(n_groups, bool)
-        np.logical_or.at(waiting, gid, ~done & (pc != cur) & ~t.mask)
-        hold = t.mask & waiting[gid]
-        pc[hold], blocked[hold], blocked[t.mask & ~hold] = cur, True, False
-      elif isinstance(i, Cat0):
-        if i.op == mesa.OPC_END: done |= t.mask
-        elif i.op in BRANCHES: pc[t.mask & taken(t, i)] = i.target
-        elif i.op == mesa.OPC_CALL:
-          if (depth[t.mask] >= len(calls)).any(): raise RuntimeError(f"pc {cur}: call stack overflow")
-          calls[depth[t.mask], np.nonzero(t.mask)[0]], pc[t.mask] = cur + 1, i.target
-          depth[t.mask] += 1
-        elif i.op == mesa.OPC_RET:
-          if (depth[t.mask] == 0).any(): raise RuntimeError(f"pc {cur}: ret without call")
-          depth[t.mask] -= 1
-          pc[t.mask] = calls[depth[t.mask], np.nonzero(t.mask)[0]]
-      if not done.any() and not blocked.any() and (pc == pc[0]).all(): together = int(pc[0])
+  assert n_local <= MAX_LOCAL, f"local size {n_local} exceeds {MAX_LOCAL}"
+  prog, uses_lmem, uses_pvt, max_r = decode(d.image)
+  n_init = min(A0, max(max_r, d.localid_reg + 3 if d.localid_reg != 0xfc else 0, d.wgid_reg + 3 if d.wgid_reg != 0xfc else 0))
+  r_buf, h_buf = np.empty((NREGS + 3) * n_local, np.uint32), np.empty((NREGS + 3) * n_local, np.uint16)
+  lmem_sz, pvt_sz = d.lmem_size if uses_lmem else 0, d.pvt_size if uses_pvt else 0
+  lmem, pvt = np.empty(max(lmem_sz, 1), np.uint8), np.empty(max(pvt_sz * n_local, 1), np.uint8)
+  tex_m, ibo_m, err = _pack_images(d.textures), _pack_images(d.ibos), np.zeros(2, np.int32)
+  params = np.array([n_local, n_groups, d.local_size[0], d.local_size[1], d.groups[0], d.groups[1],
+                     d.localid_reg, d.wgid_reg, lmem_sz, pvt_sz, len(d.textures), len(d.ibos),
+                     int(d.demote), d.entry, np.int32(np.uint32(REG_INIT)), n_init], np.int32)
+  vm_kernel()(prog.ctypes.data, d.consts.ctypes.data, 0, r_buf.ctypes.data, h_buf.ctypes.data,
+              lmem.ctypes.data, pvt.ctypes.data, tex_m.ctypes.data, ibo_m.ctypes.data, err.ctypes.data, params.ctypes.data, 0, 0)
+  code, epc = int(err[0]), int(err[1])
+  if code == 1: raise decode_inst(epc, int(np.frombuffer(d.image, np.uint64)[epc])).error()
+  if code: raise RuntimeError("every thread is waiting at a bar" if code == 9 else f"pc {epc}: {ERR_MSGS[code]}")

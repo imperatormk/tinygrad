@@ -34,7 +34,7 @@ class QCOMDriver(VirtDriver):
     nr = req & 0xFF
     self.gpu.progress()
     # GPU_COMMAND runs in a ctypes callback that can't raise, errors surface on the next wait
-    if self.gpu.errors and nr in WAIT_IOCTLS:
+    if self.gpu.error is not None and nr in WAIT_IOCTLS:
       err = self.gpu.report_error()
       raise EmulatorError(str(err)) from err
     if nr == _ioctl_nr(kgsl.IOCTL_KGSL_DRAWCTXT_CREATE): kgsl.struct_kgsl_drawctxt_create.from_address(argp).drawctxt_id = 1
