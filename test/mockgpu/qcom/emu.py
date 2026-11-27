@@ -1,13 +1,13 @@
-import functools, itertools, math
+import functools, hashlib, itertools, math, pathlib, sys
 from dataclasses import dataclass
 from typing import Callable
 import numpy as np
-from tinygrad.helpers import Context, getbits
+from tinygrad.helpers import Context, getbits, diskcache_get, diskcache_put
 from tinygrad.runtime.autogen import mesa
 from tinygrad.uop.ops import UOp, Ops, KernelInfo
 from tinygrad.dtype import DType, dtypes, AddrSpace
 from tinygrad.device import Device
-from tinygrad.engine.realize import get_runtime
+from tinygrad.renderer import TinyELF
 from tinygrad.codegen import to_program
 
 NREGS, A0, P0, MAX_LOCAL = 64 * 4, 61 * 4, 62 * 4, 1024
@@ -195,7 +195,7 @@ SIGNED_IOPS = {mesa.OPC_ADD_S, mesa.OPC_SUB_S, mesa.OPC_MIN_S, mesa.OPC_MAX_S, m
 def _idx(groups:tuple[tuple[int, ...], ...]) -> dict[int, int]: return {op: i for i, g in enumerate(groups) for op in g}
 FMISC_IDX = _idx(((mesa.OPC_MIN_F,), (mesa.OPC_MAX_F,), (mesa.OPC_SIGN_F,), (mesa.OPC_ABSNEG_F,), (mesa.OPC_FLOOR_F,),
                   (mesa.OPC_TRUNC_F,), (mesa.OPC_SEL_F32,), (mesa.OPC_CMPS_F, mesa.OPC_CMPV_F)))
-# Shared integer op indices: 0..24 are fast 32-bit ops (K_IALU32), 25..35 are misc/sat/cmp ops (K_IMISC handles all 36)
+# K_IALU32 runs the ops before MIN_U, K_IMISC runs all of them (with sat/ei/half and the add/sub before AND_B saturating)
 INT_IDX = _idx((
   (mesa.OPC_ADD_U,), (mesa.OPC_ADD_S,), (mesa.OPC_SUB_U,), (mesa.OPC_SUB_S,),
   (mesa.OPC_AND_B,), (mesa.OPC_OR_B,), (mesa.OPC_XOR_B,), (mesa.OPC_NOT_B,),
@@ -213,6 +213,7 @@ MEM_IDX = _idx(((mesa.OPC_LDG,), (mesa.OPC_STG,), (mesa.OPC_LDL,), (mesa.OPC_STL
 CTRL_IDX = _idx(((mesa.OPC_NOP, mesa.OPC_PREDE, mesa.OPC_FENCE), (mesa.OPC_END,), (mesa.OPC_JUMP,), (mesa.OPC_BR,), (mesa.OPC_BRAO,),
                  (mesa.OPC_BRAA,), (mesa.OPC_PREDT,), (mesa.OPC_PREDF,), (mesa.OPC_CALL,), (mesa.OPC_RET,), (mesa.OPC_BAR,)))
 FLOAT_OPS, ALU_OPS = FMAD_OPS | FMISC_IDX.keys(), FMAD_OPS | FMISC_IDX.keys() | INT_IDX.keys()
+N_ADDSUB, N_IALU32 = INT_IDX[mesa.OPC_AND_B], INT_IDX[mesa.OPC_MIN_U]
 
 def _rec(*xs:int) -> tuple[int, ...]: return xs + (0,) * (REC_LEN - len(xs))
 def pack_src(s:Src) -> tuple[int, int]:
@@ -245,7 +246,7 @@ def encode_inst(i:Inst, pred_targets:dict[int, int]) -> tuple[int, ...]:
             (int(is_bw) << 8) | (int(src_half) << 9) | (int(i.op in SIGNED_IOPS) << 10)
     if i.op in FMISC_IDX: return _rec(K_FMISC, FMISC_IDX[i.op], i.dst, i.iterations, flags, *_pack3(i.srcs))
     iop = INT_IDX[i.op]
-    fast_i = not src_half and not i.dst_half and not i.sat and not ei and iop < 25 and (is_bw or all(s.absneg == 0 for s in i.srcs))
+    fast_i = not src_half and not i.dst_half and not i.sat and not ei and iop < N_IALU32 and (is_bw or all(s.absneg == 0 for s in i.srcs))
     return _rec(K_IALU32 if fast_i else K_IMISC, iop, i.dst, i.iterations, flags, *_pack3(i.srcs))
   if isinstance(i, Cat4):
     return _rec(K_SFU, SFU_IDX[i.op], i.dst, i.iterations, int(i.dst_half) | (int(i.sat) << 1) | (int(i.srcs[0].half) << 2), *_pack3(i.srcs))
@@ -259,29 +260,8 @@ def encode_inst(i:Inst, pred_targets:dict[int, int]) -> tuple[int, ...]:
   assert isinstance(i, Ibo)
   return _rec(K_TEX, 1, i.ssbo, i.ncomp, i.type << 4, 0, 0, 0, i.coord, i.val)
 
-def _max_reg(prog:list[Inst|None]) -> int:
-  hi = 0
-  for i in prog:
-    if i is None: continue
-    for s in getattr(i, "srcs", ()):
-      if s.kind == "r" and s.val < A0: hi = max(hi, s.val + i.iterations)
-    if hasattr(i, "dst") and not isinstance(i, Ibo) and i.dst < A0:
-      hi = max(hi, i.dst + (4 if isinstance(i, Cat5) else i.size if isinstance(i, Load) else i.iterations))
-    if isinstance(i, Cat1) and i.op == mesa.OPC_SWZ: hi = max(hi, *(r + 1 for r in i.dsts if r < A0), 0)
-    if isinstance(i, (Load, Store)):
-      if i.addr < A0: hi = max(hi, i.addr + 2)
-      if isinstance(i, Store) and i.val < A0: hi = max(hi, i.val + i.size)
-      if (ro := getattr(i, "reg_off", None)) is not None and ro[0] < A0: hi = max(hi, ro[0] + 1)
-    if isinstance(i, Cat5):
-      if i.src1 < A0: hi = max(hi, i.src1 + 2)
-      if i.s2en and i.src3 < A0: hi = max(hi, i.src3 + 1)
-    if isinstance(i, Ibo):
-      if i.coord < A0: hi = max(hi, i.coord + 2)
-      if i.val < A0: hi = max(hi, i.val + i.ncomp)
-  return min(hi, A0)
-
 @functools.cache
-def decode(image:bytes) -> tuple[np.ndarray, bool, bool, int]:
+def decode(image:bytes) -> np.ndarray:
   prog:list[Inst|None] = []
   for pc, word in enumerate(np.frombuffer(image, np.uint64).tolist()):
     try: prog.append(decode_inst(pc, word))
@@ -293,9 +273,7 @@ def decode(image:bytes) -> tuple[np.ndarray, bool, bool, int]:
     nxt, after = preds[idx + 1] if idx + 1 < len(preds) else None, preds[idx + 2] if idx + 2 < len(preds) else None
     if nxt is not None and nxt.op == mesa.OPC_PREDE: pred_targets[i.pc] = nxt.pc
     elif nxt is not None and nxt.op != i.op and after is not None and after.op == mesa.OPC_PREDE: pred_targets[i.pc] = nxt.pc + 1
-  recs = [encode_inst(i, pred_targets) if i is not None else _rec(K_UNDEF) for i in prog]
-  ops = {i.op for i in prog if isinstance(i, (Load, Store))}
-  return np.array(recs, np.uint32).reshape(-1), bool(ops & {mesa.OPC_LDL, mesa.OPC_STL}), bool(ops & {mesa.OPC_LDP, mesa.OPC_STP}), _max_reg(prog)
+  return np.array([encode_inst(i, pred_targets) if i is not None else _rec(K_UNDEF) for i in prog], np.uint32).reshape(-1)
 
 @dataclass(frozen=True)
 class Image: addr:int; width:int; height:int; pitch:int; dtype:np.dtype # noqa: E702
@@ -342,8 +320,7 @@ def _sat_f(fval:UOp, half:bool) -> UOp:
   z, one = _c(0.0, fdt), _c(1.0, fdt)
   return _isnan(fval, half).where(fval, (fval < z).where(z, (fval > one).where(one, fval)))
 
-@functools.cache
-def vm_kernel() -> Callable[..., None]:
+def _build_vm() -> tuple[TinyELF, list[int]]:
   I32, U32, U16, U8, U64, I64 = dtypes.int32, dtypes.uint32, dtypes.uint16, dtypes.uint8, dtypes.uint64, dtypes.int64
   F32, F64, F16 = dtypes.float32, dtypes.float64, dtypes.half
   def _ci(v:int) -> UOp: return UOp.const(v, I32)
@@ -354,7 +331,7 @@ def vm_kernel() -> Callable[..., None]:
   r_buf, h_buf = UOp.param(3, U32, (NREGS + 3) * MAX_LOCAL, name="r"), UOp.param(4, U16, (NREGS + 3) * MAX_LOCAL, name="h")
   lmem, pvt = UOp.param(5, U8, 1 << 20, name="lmem"), UOp.param(6, U8, 1 << 26, name="pvt")
   tex_m, ibo_m = UOp.param(7, U64, 1024 * 5, name="tex_m"), UOp.param(8, U64, 1024 * 5, name="ibo_m")
-  err, p_i = UOp.param(9, I32, 2, name="err"), UOp.param(10, I32, 16, name="p_i")
+  err, p_i = UOp.param(9, I32, 2, name="err"), UOp.param(10, I32, 14, name="p_i")
   vmem16, vmem32 = UOp.param(11, U16, 1 << 45, name="vmem16"), UOp.param(12, U32, 1 << 44, name="vmem32")
   st_pc, st_done = UOp.alloc((MAX_LOCAL,), I32, 0, AddrSpace.REG), UOp.alloc((MAX_LOCAL,), U8, 1, AddrSpace.REG)
   st_blk, st_dep = UOp.alloc((MAX_LOCAL,), U8, 2, AddrSpace.REG), UOp.alloc((MAX_LOCAL,), I32, 3, AddrSpace.REG)
@@ -364,29 +341,21 @@ def vm_kernel() -> Callable[..., None]:
   tmp, tmp_f64 = UOp.alloc((MAX_LOCAL,), U32, 8, AddrSpace.REG), UOp.alloc((MAX_LOCAL,), F64, 9, AddrSpace.REG)
 
   n_local, n_groups, lx, ly, gx, gy, lid_reg, wgid_reg = [p_i.index(j).load() for j in range(8)]
-  lmem_sz, pvt_sz, n_tex, n_ibo, demote, entry, reg_init_i, n_init = [p_i.index(j).load() for j in range(8, 16)]
-  reg_init = reg_init_i.cast(U32)
+  lmem_sz, pvt_sz, n_tex, n_ibo, demote, entry = [p_i.index(j).load() for j in range(8, 14)]
   init_err = UOp.group(err.index(0).store(_ci(0)), err.index(1).store(_ci(0)))
 
   wg = UOp.range(n_groups, ax())
-  r_i, s_i = UOp.range(n_init * n_local, ax()), UOp.range((NREGS - A0) * n_local, ax())
-  lm_i, pv_i = UOp.range(lmem_sz, ax()), UOp.range(pvt_sz * n_local, ax())
-  init_r = UOp.group(
-    UOp.group(r_buf.after(init_err, wg).index(r_i).store(reg_init),
-              h_buf.after(init_err, wg).index(r_i).store((reg_init & _c(0xFFFF)).cast(U16))).end(r_i),
-    r_buf.after(init_err, wg).index(_ci(A0) * n_local + s_i).store(reg_init).end(s_i))
+  wg_dep = UOp.group(init_err, wg)
   l0 = UOp.range(n_local, ax())
   g_xyz = [(wg % gx).cast(U32), ((wg // gx) % gy).cast(U32), (wg // (gx * gy)).cast(U32)]
   l_xyz = [(l0 % lx).cast(U32), ((l0 // lx) % ly).cast(U32), (l0 // (lx * ly)).cast(U32)]
   has_lid, has_wg = lid_reg.ne(_ci(0xfc)), wgid_reg.ne(_ci(0xfc))
   init_ids = UOp.group(
-    *[r_buf.after(init_r).index(((lid_reg + _ci(j)) * n_local + l0).valid(has_lid)).store(l_xyz[j]) for j in range(3)],
-    *[r_buf.after(init_r).index(((wgid_reg + _ci(j)) * n_local + l0).valid(has_wg)).store(g_xyz[j]) for j in range(3)],
-    st_pc.after(init_r).index(l0).store(entry), st_done.after(init_r).index(l0).store(_c(0, U8)),
-    st_blk.after(init_r).index(l0).store(_c(0, U8)), st_dep.after(init_r).index(l0).store(_ci(0))).end(l0)
-  init_wg = UOp.group(lmem.after(init_err, wg).index(lm_i).store(_c(0, U8)).end(lm_i),
-                      pvt.after(init_err, wg).index(pv_i).store(_c(0, U8)).end(pv_i),
-                      init_ids, st_uni.after(init_r).index(0).store(entry), st_go.after(init_r).index(0).store(_c(1, U8)))
+    *[r_buf.after(wg_dep).index(((lid_reg + _ci(j)) * n_local + l0).valid(has_lid)).store(l_xyz[j]) for j in range(3)],
+    *[r_buf.after(wg_dep).index(((wgid_reg + _ci(j)) * n_local + l0).valid(has_wg)).store(g_xyz[j]) for j in range(3)],
+    st_pc.after(wg_dep).index(l0).store(entry), st_done.after(wg_dep).index(l0).store(_c(0, U8)),
+    st_blk.after(wg_dep).index(l0).store(_c(0, U8)), st_dep.after(wg_dep).index(l0).store(_ci(0))).end(l0)
+  init_wg = UOp.group(init_ids, st_uni.after(wg_dep).index(0).store(entry), st_go.after(wg_dep).index(0).store(_c(1, U8)))
 
   loop = UOp.loop(ax()).replace(src=(UOp(Ops.NOOP).after(init_wg),))
   uni = st_uni.after(loop).index(0).load()
@@ -408,6 +377,7 @@ def vm_kernel() -> Callable[..., None]:
   cur = st_cur.after(picked).index(0).load()
   rec = [prog.after(picked).index((cur * _ci(REC_LEN) + _ci(j)).valid(go_now)).load() for j in range(REC_LEN)]
   kind, op, dst, iters, flags, s_meta, s_val = rec[0], rec[1], rec[2].cast(I32), rec[3].cast(I32), rec[4], rec[5:8], rec[8:11]
+  def op_is(table:dict[int, int], *opcs:int) -> UOp: return functools.reduce(lambda a, b: a | b, [op.eq(_c(table[o])) for o in opcs])
 
   def lane_active(lane:UOp, dep:UOp) -> UOp:
     return is_uni.where(_c(True, dtypes.bool), st_pc.after(dep).index(lane).load().eq(cur) & st_done.after(dep).index(lane).load().eq(_c(0, U8)))
@@ -421,14 +391,12 @@ def vm_kernel() -> Callable[..., None]:
     return UOp.group(h_buf.after(dep).index(idx.valid(active & use_h)).store((val_u32 & _c(0xFFFF)).cast(U16)),
                      r_buf.after(dep).index(idx.valid(active & _not(use_h))).store(val_u32))
   def commit_tmp(dep:UOp, reg:UOp, dst_half:UOp) -> UOp:
-    use_h, base_r = dst_half.ne(_c(0)) & (reg < _ci(A0)), reg.clamp(0, NREGS - 1) * n_local
-    g_ur, l_ur = UOp.range((is_uni & _not(use_h)).cast(I32), ax()), UOp.range(n_local, ax())
-    g_uh, l_uh = UOp.range((is_uni & use_h).cast(I32), ax()), UOp.range(n_local, ax())
-    g_dv, l_dv = UOp.range(_not(is_uni).cast(I32), ax()), UOp.range(n_local, ax())
+    fast = is_uni & (dst_half.eq(_c(0)) | (reg >= _ci(A0)))
+    g_f, l_f = UOp.range(fast.cast(I32), ax()), UOp.range(n_local, ax())
+    g_g, l_g = UOp.range(_not(fast).cast(I32), ax()), UOp.range(n_local, ax())
     return UOp.group(
-      r_buf.after(dep, g_ur).index(base_r + l_ur).store(tmp.after(dep, g_ur).index(l_ur).load()).end(l_ur).end(g_ur),
-      h_buf.after(dep, g_uh).index(base_r + l_uh).store((tmp.after(dep, g_uh).index(l_uh).load() & _c(0xFFFF)).cast(U16)).end(l_uh).end(g_uh),
-      write_reg(UOp.group(dep, g_dv), l_dv, lane_active(l_dv, g_dv), reg, dst_half, tmp.after(dep, g_dv).index(l_dv).load()).end(l_dv).end(g_dv))
+      r_buf.after(dep, g_f).index(reg.clamp(0, NREGS - 1) * n_local + l_f).store(tmp.after(dep, g_f).index(l_f).load()).end(l_f).end(g_f),
+      write_reg(UOp.group(dep, g_g), l_g, lane_active(l_g, g_g), reg, dst_half, tmp.after(dep, g_g).index(l_g).load()).end(l_g).end(g_g))
 
   # Resolve a source ONCE before `for (lane)` into (dep, (base_row, and_mask, xor_mask)); handles r/c/c</i/demote/half>=A0
   def prep_src(dep:UOp, slot:int, meta:UOp, val:UOp, k:UOp, is_float:bool, half:bool, bw_neg:UOp|None=None,
@@ -471,7 +439,7 @@ def vm_kernel() -> Callable[..., None]:
   def _fconv(fv:UOp, half:bool, dst_half:UOp) -> UOp:
     return dst_half.ne(_c(0)).where(fv.bitcast(U16).cast(U32), fv.cast(F32).bitcast(U32)) if half else \
            dst_half.ne(_c(0)).where(_cov_to_float(fv.cast(F64), True, _c(0)).bitcast(U16).cast(U32), fv.bitcast(U32))
-  def _ialu_25(au:UOp, bu:UOp, cu:UOp, bits:int, udt:DType, sdt:DType) -> list[UOp]:
+  def _ialu_32(au:UOp, bu:UOp, cu:UOp, bits:int, udt:DType, sdt:DType) -> list[UOp]:
     ai, bi, all1 = au.bitcast(sdt), bu.bitcast(sdt), _c(0xFFFF if bits == 16 else 0xFFFFFFFF, udt)
     sh, sha = bu & _c(bits - 1, udt), au & _c(bits - 1, udt)
     a32, b32, c32 = au.cast(U32), bu.cast(U32), cu.cast(U32)
@@ -521,12 +489,12 @@ def vm_kernel() -> Callable[..., None]:
                      (a64 < tr64).where(tr64 - _c(1.0, F64), tr64).cast(fdt), tr64.cast(fdt), ((b > z) | b.eq(z)).where(a, c)])
     fu = _ftz_u(fout.bitcast(udt), half)
     sat, dst_half = (flags >> _c(1)) & _c(1), flags & _c(1)
-    fc = op.eq(_c(6)).where(fu, _cnan_u(fu, half)).bitcast(fdt)
+    fc = op_is(FMISC_IDX, mesa.OPC_SEL_F32).where(fu, _cnan_u(fu, half)).bitcast(fdt)
     out_f = _fconv(sat.ne(_c(0)).where(_sat_f(fc, half), fc), half, dst_half)
     cmp_u = _sel((flags >> _c(4)) & _c(7), [a < b, (a < b) | a.eq(b), a > b, (a > b) | a.eq(b), a.eq(b), a.ne(b)]).cast(udt)
     cmp_u = sat.ne(_c(0)).where(cmp_u ^ _c(1, udt), cmp_u)
     cmp_u = ((flags >> _c(2)) & _c(1)).ne(_c(0)).where(_c(0, udt) - cmp_u, cmp_u)
-    comp = tmp.after(sp).index(lane).store(op.eq(_c(7)).where(cmp_u.cast(U32), out_f)).end(lane)
+    comp = tmp.after(sp).index(lane).store(op_is(FMISC_IDX, mesa.OPC_CMPS_F).where(cmp_u.cast(U32), out_f)).end(lane)
     return commit_tmp(comp, dst + k, dst_half).end(k).end(g)
   s_fmisc = UOp.group(emit_fmisc(False), emit_fmisc(True))
 
@@ -535,7 +503,7 @@ def vm_kernel() -> Callable[..., None]:
   sp_ia, ss_ia = prep_3(UOp.group(g_ia, k_ia), k_ia, False, False, (flags >> _c(8)) & _c(1))
   l_ia = UOp.range(n_local, ax())
   a_i, b_i, c_i = [ld_src(r_buf, sp_ia, l_ia, ss_ia[j]) for j in range(3)]
-  s_ialu32 = commit_tmp(tmp.after(sp_ia).index(l_ia).store(_sel(op, _ialu_25(a_i, b_i, c_i, 32, U32, I32))).end(l_ia),
+  s_ialu32 = commit_tmp(tmp.after(sp_ia).index(l_ia).store(_sel(op, _ialu_32(a_i, b_i, c_i, 32, U32, I32))).end(l_ia),
                         dst + k_ia, _c(0)).end(k_ia).end(g_ia)
 
   # 5. K_IMISC (16-bit int ops + sat/ei/cmp/clz/ctz/min/max/absneg/sad/signed-mod)
@@ -564,16 +532,18 @@ def vm_kernel() -> Callable[..., None]:
     cond = (flags >> _c(4)) & _c(7)
     cu_b = _sel(cond, [au < bu, au <= bu, au > bu, au >= bu, au.eq(bu), au.ne(bu)])
     cs_b = _sel(cond, [ai < bi, ai <= bi, ai > bi, ai >= bi, ai.eq(bi), ai.ne(bi)])
-    cmp_v = op.eq(_c(35)).where(cs_b, cu_b).cast(udt)
+    is_cmps_s = op_is(INT_IDX, mesa.OPC_CMPS_S)
+    cmp_v = is_cmps_s.where(cs_b, cu_b).cast(udt)
     cmp_v = sat.where(cmp_v ^ _c(1, udt), cmp_v)
     cmp_v = ((flags >> _c(2)) & _c(1)).ne(_c(0)).where(_c(0, udt) - cmp_v, cmp_v)
-    out32 = _sel(op, [add_u.cast(U32), add_s.cast(U32), sub_u.cast(U32), sub_s.cast(U32)] + _ialu_25(au, bu, cu, bits, udt, sdt)[4:] + [
+    addsub = [add_u.cast(U32), add_s.cast(U32), sub_u.cast(U32), sub_s.cast(U32)]
+    out32 = _sel(op, addsub + _ialu_32(au, bu, cu, bits, udt, sdt)[N_ADDSUB:] + [
       (au < bu).where(au, bu).cast(U32), (ai < bi).where(au, bu).cast(U32),
       (au > bu).where(au, bu).cast(U32), (ai > bi).where(au, bu).cast(U32), au.cast(U32),
       _clz_u(au, bits).cast(U32), _clz_u((ai < _c(0, sdt)).where(au ^ all1, au), bits).cast(U32),
       _clz_u(au, bits, True).cast(U32), (au + bu + cu).cast(U32), cmp_v.cast(U32), cmp_v.cast(U32)])
     dst_half = flags & _c(1)
-    if half: out32 = (dst_half.eq(_c(0)) & is_s & op.ne(_c(35))).where(out32.cast(U16).bitcast(dtypes.int16).cast(I32).bitcast(U32), out32)
+    if half: out32 = (dst_half.eq(_c(0)) & is_s & _not(is_cmps_s)).where(out32.cast(U16).bitcast(dtypes.int16).cast(I32).bitcast(U32), out32)
     return commit_tmp(tmp.after(sp).index(lane).store(out32).end(lane), dst + k, dst_half).end(k).end(g)
   s_imisc = UOp.group(emit_imisc(False), emit_imisc(True))
 
@@ -659,7 +629,8 @@ def vm_kernel() -> Callable[..., None]:
   roff = ((r_buf.after(g_mem).index(r_src2 * n_local + l_mem).load().cast(U64) << r_sh) + r_off) * esz.cast(U64)
   gaddr = ((flags >> _c(2)) & _c(1)).ne(_c(0)).where(gaddr + roff, gaddr)
   lp_off = r_buf.after(g_mem).index(areg * n_local + l_mem).load().bitcast(I32) + moff
-  is_g, is_l, is_p, is_ld = op < _c(2), (op.eq(_c(2)) | op.eq(_c(3))), op >= _c(4), (op & _c(1)).eq(_c(0))
+  is_g, is_l = op_is(MEM_IDX, mesa.OPC_LDG, mesa.OPC_STG), op_is(MEM_IDX, mesa.OPC_LDL, mesa.OPC_STL)
+  is_p, is_ld = op_is(MEM_IDX, mesa.OPC_LDP, mesa.OPC_STP), op_is(MEM_IDX, mesa.OPC_LDG, mesa.OPC_LDL, mesa.OPC_LDP)
   l_ok, p_ok = (lp_off >= _ci(0)) & (lp_off + esz * iters <= lmem_sz), (lp_off >= _ci(0)) & (lp_off + esz * iters <= pvt_sz)
   mem_ok = act_mem & is_g.where(_c(True, dtypes.bool), is_l.where(l_ok, p_ok))
   c_m = UOp.range(iters, ax())
@@ -681,7 +652,7 @@ def vm_kernel() -> Callable[..., None]:
                      pvt.after(g_mem).index((l_mem * pvt_sz + lp_off + c_off + _ci(b)).valid(ok & is_p)).store(bv))
   s_mem = UOp.group(write_reg(UOp.group(g_mem, gaddr, lp_off, ld_val), l_mem, act_mem & is_ld, dst + c_m, m_half, ld_val),
                     *[st_b(b) for b in range(4)], set_err(g_mem, act_mem & is_l & _not(l_ok), 3),
-                    set_err(g_mem, act_mem & op.eq(_c(5)) & _not(p_ok), 4)).end(c_m).end(l_mem).end(g_mem)
+                    set_err(g_mem, act_mem & op_is(MEM_IDX, mesa.OPC_STP) & _not(p_ok), 4)).end(c_m).end(l_mem).end(g_mem)
 
   # 9. K_TEX (Cat5 ISAM + Ibo STIB using direct uint16/uint32 loads/stores)
   g_is = UOp.range((go_now & kind.eq(_c(K_TEX)) & op.eq(_c(0))).cast(I32), ax())
@@ -737,8 +708,10 @@ def vm_kernel() -> Callable[..., None]:
   is_non_ctrl, is_ctrl = go_now & kind.ne(_c(K_CTRL)) & kind.ne(_c(K_UNDEF)), go_now & kind.eq(_c(K_CTRL))
   g_adv_u = UOp.range((is_non_ctrl & is_uni).cast(I32), ax())
   g_adv_d, l_ad = UOp.range((is_non_ctrl & _not(is_uni)).cast(I32), ax()), UOp.range(n_local, ax())
-  g_unop = UOp.range((is_ctrl & is_uni & op.eq(_c(0))).cast(I32), ax())
-  g_cf = UOp.range((is_ctrl & _not(is_uni & op.eq(_c(0)))).cast(I32), ax())
+  is_nop, is_end, is_call, is_ret, is_bar = [op_is(CTRL_IDX, o) for o in (mesa.OPC_NOP, mesa.OPC_END, mesa.OPC_CALL, mesa.OPC_RET, mesa.OPC_BAR)]
+  is_br = op_is(CTRL_IDX, mesa.OPC_JUMP, mesa.OPC_BR, mesa.OPC_BRAO, mesa.OPC_BRAA, mesa.OPC_PREDT, mesa.OPC_PREDF)
+  g_unop = UOp.range((is_ctrl & is_uni & is_nop).cast(I32), ax())
+  g_cf = UOp.range((is_ctrl & _not(is_uni & is_nop)).cast(I32), ax())
   l_bar, l_cf = UOp.range(n_local, ax()), UOp.range(n_local, ax())
   bar_other = (_not(is_uni) & st_done.after(exec_done, g_cf).index(l_bar).load().eq(_c(0, U8)) &
                st_pc.after(exec_done, g_cf).index(l_bar).load().ne(cur)).cast(I32).reduce(l_bar, arg=Ops.MAX)
@@ -751,15 +724,15 @@ def vm_kernel() -> Callable[..., None]:
   br_go = _sel(op, [_c(False, dtypes.bool), _c(False, dtypes.bool), _c(True, dtypes.bool), c1, c1 | c2, c1 & c2, _not(p0_nz), p0_nz])
   nxt_pc = cur + _ci(1)
   ret_pc = st_calls.after(dep_cf).index(((dep_l - _ci(1)).clamp(0, 15)) * n_local + l_cf).load()
-  new_pc = ((op >= _c(2)) & (op <= _c(7))).where(br_go.where(dst, nxt_pc), op.eq(_c(8)).where(dst, op.eq(_c(9)).where(ret_pc,
-           op.eq(_c(10)).where(bar_other.ne(_ci(0)).where(cur, nxt_pc), nxt_pc))))
-  call_ovf, ret_udf = act_cf & op.eq(_c(8)) & (dep_l >= _ci(16)), act_cf & op.eq(_c(9)) & (dep_l <= _ci(0))
+  bar_pc = bar_other.ne(_ci(0)).where(cur, nxt_pc)
+  new_pc = is_br.where(br_go.where(dst, nxt_pc), is_call.where(dst, is_ret.where(ret_pc, is_bar.where(bar_pc, nxt_pc))))
+  call_ovf, ret_udf = act_cf & is_call & (dep_l >= _ci(16)), act_cf & is_ret & (dep_l <= _ci(0))
   s_cf_lanes = UOp.group(
     st_pc.after(dep_cf).index(l_cf.valid(act_cf)).store(new_pc),
-    st_done.after(dep_cf).index(l_cf.valid(act_cf)).store(op.eq(_c(1)).where(_c(1, U8), st_done.after(dep_cf).index(l_cf).load())),
-    st_blk.after(dep_cf).index(l_cf.valid(act_cf)).store(op.eq(_c(10)).where(bar_other.ne(_ci(0)).cast(U8), st_blk.after(dep_cf).index(l_cf).load())),
-    st_dep.after(dep_cf).index(l_cf.valid(act_cf)).store(op.eq(_c(8)).where(dep_l + _ci(1), op.eq(_c(9)).where(dep_l - _ci(1), dep_l))),
-    st_calls.after(dep_cf).index((dep_l.clamp(0, 15) * n_local + l_cf).valid(act_cf & op.eq(_c(8)) & _not(call_ovf))).store(nxt_pc),
+    st_done.after(dep_cf).index(l_cf.valid(act_cf)).store(is_end.where(_c(1, U8), st_done.after(dep_cf).index(l_cf).load())),
+    st_blk.after(dep_cf).index(l_cf.valid(act_cf)).store(is_bar.where(bar_other.ne(_ci(0)).cast(U8), st_blk.after(dep_cf).index(l_cf).load())),
+    st_dep.after(dep_cf).index(l_cf.valid(act_cf)).store(is_call.where(dep_l + _ci(1), is_ret.where(dep_l - _ci(1), dep_l))),
+    st_calls.after(dep_cf).index((dep_l.clamp(0, 15) * n_local + l_cf).valid(act_cf & is_call & _not(call_ovf))).store(nxt_pc),
     set_err(dep_cf, call_ovf, 7), set_err(dep_cf, ret_udf, 8)).end(l_cf)
   l_rc, pc0 = UOp.range(n_local, ax()), st_pc.after(s_cf_lanes).index(0).load()
   any_diff = (st_done.after(s_cf_lanes).index(l_rc).load().ne(_c(0, U8)) | st_blk.after(s_cf_lanes).index(l_rc).load().ne(_c(0, U8)) |
@@ -775,7 +748,17 @@ def vm_kernel() -> Callable[..., None]:
 
   with Context(NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="", TRANSCENDENTAL=1, CAPTURE_PROCESS_REPLAY=0):
     prg = to_program(UOp.sink(wg_done, arg=KernelInfo(name="qcom_a630_vm")), Device["CPU"].renderer)
-  rt, slots = get_runtime("CPU", prg), [p.arg.slot for p in prg.kernel_params]
+  return TinyELF.from_program(prg), [p.arg.slot for p in prg.kernel_params]
+
+@functools.cache
+def vm_kernel() -> Callable[..., None]:
+  if (vm:=diskcache_get("qcom_a630_vm", key:=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest())) is None:
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(10000) # hypothesis lowers it inside a test, and hashing the VM graph recurses deeper than that
+    try: diskcache_put("qcom_a630_vm", key, vm:=_build_vm())
+    finally: sys.setrecursionlimit(limit)
+  obj, slots = vm
+  rt = Device["CPU"].runtime(obj, links={})
   return lambda *bufs: rt(*[bufs[s] for s in slots])
 
 def _pack_images(imgs:list[Image]) -> np.ndarray:
@@ -785,15 +768,12 @@ def _pack_images(imgs:list[Image]) -> np.ndarray:
 def run(d:Dispatch):
   n_local, n_groups = math.prod(d.local_size), math.prod(d.groups)
   assert n_local <= MAX_LOCAL, f"local size {n_local} exceeds {MAX_LOCAL}"
-  prog, uses_lmem, uses_pvt, max_r = decode(d.image)
-  n_init = min(A0, max(max_r, d.localid_reg + 3 if d.localid_reg != 0xfc else 0, d.wgid_reg + 3 if d.wgid_reg != 0xfc else 0))
-  r_buf, h_buf = np.empty((NREGS + 3) * n_local, np.uint32), np.empty((NREGS + 3) * n_local, np.uint16)
-  lmem_sz, pvt_sz = d.lmem_size if uses_lmem else 0, d.pvt_size if uses_pvt else 0
-  lmem, pvt = np.empty(max(lmem_sz, 1), np.uint8), np.empty(max(pvt_sz * n_local, 1), np.uint8)
+  prog = decode(d.image)
+  r_buf, h_buf = np.full((NREGS + 3) * n_local, REG_INIT, np.uint32), np.full((NREGS + 3) * n_local, REG_INIT & 0xFFFF, np.uint16)
+  lmem, pvt = np.zeros(max(d.lmem_size, 1), np.uint8), np.zeros(max(d.pvt_size * n_local, 1), np.uint8)
   tex_m, ibo_m, err = _pack_images(d.textures), _pack_images(d.ibos), np.zeros(2, np.int32)
   params = np.array([n_local, n_groups, d.local_size[0], d.local_size[1], d.groups[0], d.groups[1],
-                     d.localid_reg, d.wgid_reg, lmem_sz, pvt_sz, len(d.textures), len(d.ibos),
-                     int(d.demote), d.entry, np.int32(np.uint32(REG_INIT)), n_init], np.int32)
+                     d.localid_reg, d.wgid_reg, d.lmem_size, d.pvt_size, len(d.textures), len(d.ibos), int(d.demote), d.entry], np.int32)
   vm_kernel()(prog.ctypes.data, d.consts.ctypes.data, 0, r_buf.ctypes.data, h_buf.ctypes.data,
               lmem.ctypes.data, pvt.ctypes.data, tex_m.ctypes.data, ibo_m.ctypes.data, err.ctypes.data, params.ctypes.data, 0, 0)
   code, epc = int(err[0]), int(err[1])

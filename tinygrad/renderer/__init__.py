@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Callable, Generator, cast
-import subprocess, pathlib, struct
+import subprocess, pathlib, signal, struct
 from dataclasses import dataclass, replace
 from tinygrad.helpers import prod, Target, EMULATED_DTYPES, CCACHE, getenv, diskcache_get, diskcache_put, unwrap, round_up
 from tinygrad.uop.ops import Ops, UOp, sint, ssimplify, smin, GroupOp, PatternMatcher
@@ -20,18 +20,16 @@ class Compiler:
     return lib
   def disassemble(self, lib:bytes): pass
   def server(self, cmd:str, arch:str, *args) -> subprocess.Popen:
-    argv = f"{cmd} {pathlib.Path(__file__).parents[1]}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}".split()
-    self._server = lambda: subprocess.Popen(argv + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
-    return self._server()
+    argv = f"{cmd} {pathlib.Path(__file__).parent.parent}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}"
+    return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
   def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
-    if proc.poll() is not None: proc = self.compiler_process = self._server()
+    # BEAM's SIGALRM timeout landing mid-RPC would leave this reply in the pipe for the next compile
+    old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
     try:
-      unwrap(proc.stdin).write(struct.pack("I", len(b:=src.encode())) + b)
+      unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
       unwrap(proc.stdin).flush()
-      if len(lib:=unwrap(proc.stdout).read(n:=struct.unpack("I", unwrap(proc.stdout).read(4))[0])) != n: raise EOFError
-    except BaseException:
-      with proc: proc.kill()
-      raise
+      lib = unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])
+    finally: signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
     if lib: return lib
     raise CompileError("Compilation Error")
 

@@ -8,36 +8,18 @@ def field(val:int, name:str) -> int: return (val & getattr(mesa, f"{name}__MASK"
 def u64(lo:int, hi:int) -> int: return lo | (hi << 32)
 
 class QCOMGPU:
-  def __init__(self, mappings:dict[tuple[str, int], tuple[int, int]]):
+  def __init__(self):
     self.regs:dict[int, int] = {}
-    self.mappings = mappings
     self.consts, self.shader = np.zeros(4096, np.uint32), b""
     self.error:Exception|None = None
     self.pending:list[list[int]] = []
-
-  def report_error(self) -> Exception:
-    assert self.error is not None
-    err, self.error = self.error, None
-    # flush signal writes from already-queued IBs so later submits don't hang on their timeline waits
-    for words in self.pending:
-      i = 0
-      while i < len(words):
-        hdr = words[i]
-        if hdr >> 28 == mesa.CP_TYPE4_PKT >> 28: i += 1 + (hdr & 0x7F)
-        elif hdr >> 28 == mesa.CP_TYPE7_PKT >> 28:
-          cnt, op = hdr & 0x3FFF, (hdr >> 16) & 0x7F
-          if op == mesa.CP_EVENT_WRITE: self._exec_pkt7(op, words[i+1:i+1+cnt])
-          i += 1 + cnt
-        else: break
-    self.pending.clear()
-    return err
 
   def submit(self, addr:int, ndwords:int):
     self.pending.append(list(to_mv(addr, ndwords * 4).cast("I")))
     self.progress()
 
-  def progress(self):
-    while self.pending and self.error is None:
+  def progress(self, drain=False): # drain runs only the signal writes left after an error, so later submits don't hang on their waits
+    while self.pending and (drain or self.error is None):
       words = self.pending[0]
       while words:
         hdr = words[0]
@@ -47,7 +29,7 @@ class QCOMGPU:
         elif hdr >> 28 == mesa.CP_TYPE7_PKT >> 28:
           cnt, op = hdr & 0x3FFF, (hdr >> 16) & 0x7F
           try:
-            if not self._exec_pkt7(op, words[1:1+cnt]): return
+            if (not drain or op == mesa.CP_EVENT_WRITE) and not self._exec_pkt7(op, words[1:1+cnt]): return
           except Exception as e:
             self.error = e
             del words[:1 + cnt]
@@ -90,8 +72,6 @@ class QCOMGPU:
         raise RuntimeError(f"unsupported image descriptor {d[0]:#x} {d[2]:#x}")
       img = emu.Image(u64(d[4], d[5]), field(d[1], "A6XX_TEX_CONST_1_WIDTH"), field(d[1], "A6XX_TEX_CONST_1_HEIGHT"),
                       field(d[2], "A6XX_TEX_CONST_2_PITCH"), np.dtype(np.float32 if fmt == mesa.FMT6_32_32_32_32_FLOAT else np.float16))
-      if not any(st <= img.addr and img.addr + img.pitch * img.height <= st + sz for st, sz in self.mappings.values()):
-        raise RuntimeError(f"unmapped image {img.addr:#x}")
       ret.append(img)
     return ret
 

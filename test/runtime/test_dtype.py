@@ -98,7 +98,7 @@ class _DTypePairs:
 
   def test_bitcast(self):
     if self.DTYPE == dtypes.bool: raise unittest.SkipTest("no bools in bitcast")
-    if Device.DEFAULT == "QCOM" and DEV.renderer == "CL" and self.DTYPE == dtypes.fp8e4m3:
+    if Device.DEFAULT == "QCOM" and DEV.renderer != "IR3" and self.DTYPE == dtypes.fp8e4m3:
       raise unittest.SkipTest("QCOMCL miscompiles int min ~max(~a,~b)")
     for dtype in get_available_cast_dtypes(self.DTYPE):
       if dtype != dtypes.bool:
