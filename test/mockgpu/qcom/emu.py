@@ -753,7 +753,7 @@ def _build_vm() -> tuple[TinyELF, list[int]]:
   return TinyELF(prg.src[3].arg, prg.src[0].arg.function_name, prg.arg.target, sig), [p.arg.slot for p in prg.kernel_params]
 
 @functools.cache
-def vm_kernel() -> Callable[..., None]:
+def vm_kernel() -> Callable[..., float|None]:
   if (vm:=diskcache_get("qcom_a630_vm", key:=hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest())) is None:
     diskcache_put("qcom_a630_vm", key, vm:=_build_vm())
   obj, slots = vm
