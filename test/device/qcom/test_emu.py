@@ -33,13 +33,14 @@ class TestQCOMEmu(unittest.TestCase):
   def test_dst_conv(self):
     a = Tensor(np.array([1 + 2**-11 + 2**-13, 1e5, 2**-15 + 2**-17], np.float32))
     out = (a * Tensor(np.ones(3, np.float32))).half().numpy()
-    self.assertEqual(out.view(np.uint16).tolist(), [0x3c01, 0x7c00, 0x0])
+    self.assertEqual(out.view(np.uint16).tolist(), [0x3c00, 0x7bff, 0x0])
 
+  @unittest.skipUnless(DEV.renderer == "IR3", "CL rounds to nearest even")
   def test_cov(self):
     np.testing.assert_equal(Tensor([2**24 + 3, -(2**24 + 3), 2**31 - 1], dtype=dtypes.int32).cast(dtypes.float32).numpy(),
-                            np.array([2**24 + 4, -(2**24 + 4), 2**31], np.float32))
+                            np.array([2**24 + 2, -(2**24 + 2), 2**31 - 2**7], np.float32))
     np.testing.assert_equal(Tensor([1 + 2**-11 + 2**-13, 1e5, -1e30, 2**-20], dtype=dtypes.float32).cast(dtypes.half).numpy(),
-                            np.array([1 + 2**-10, np.inf, -np.inf, 0], np.float16))
+                            np.array([1, 65504, -65504, 0], np.float16))
 
   def test_denormals(self):
     np.testing.assert_equal((Tensor(np.array([1e-45, -1e-39, 1.0], np.float32)) * 1.5).numpy(), np.array([0, -0.0, 1.5], np.float32))
@@ -80,54 +81,20 @@ class TestQCOMEmu(unittest.TestCase):
     def poisoned(t, d, n):
       init(t, d, n)
       t.r[:] = 0x77777777
-      if isinstance(t.h, np.ndarray): t.h[:] = 0x7777
+      t.h[:] = 0x7777
     a = np.arange(1, 26, dtype=np.float32).reshape(5, 5)
     with patch.object(emu.Threads, "__init__", poisoned), Context(IMAGE=1): np.testing.assert_equal(Tensor(a).triu(1).numpy(), np.triu(a, 1))
 
   @unittest.skipUnless(DEV.interface.startswith("MOCK"), "MOCK only")
-  def test_alu_blocks(self):
-    from test.mockgpu.qcom import emu
-    run, dispatches = emu.run, []
-    def capture(d):
-      dispatches.append(d)
-      run(d)
-    w = np.random.default_rng(0).standard_normal((1, 1, 13, 13)).astype(np.float32)
-    x, y = Tensor(np.arange(-40, 40, dtype=np.int32)), Tensor(np.arange(80, dtype=np.int32) * 7919)
-    u = Tensor(np.arange(80, dtype=np.uint32) * 2654435761)
-    with patch.object(emu, "run", capture), Context(IMAGE=1):
-      floats = Tensor(w).conv2d(Tensor(w[..., :3, :3]), padding=1) + Tensor(w)
-      ints = (x * y - x) ^ (y >> 3) | (x & ~y)
-      selects = (x > 0).where(x, y)
-      uints = ((u >> 5) & (u | 3)) - (u << 2)
-      Tensor.realize(floats, ints, selects, uints)
-    denormals, normals, specials = [1e-45, -1e-38], [1e-20, 0.1, 1.5, -2.0, -3.0, 7.0, 3e38], [-0.0, np.nan, np.inf, -np.inf]
-    values = np.array(denormals + normals + specials, np.float32).view(np.uint32)
-    checked = 0
-    for d in dispatches:
-      prog = emu.decode(d.image)
-      targets = {i.target for i in prog if isinstance(i, emu.Cat0) and i.op in emu.JUMPS}
-      for start, b in emu.alu_blocks(d.image, d.entry).items():
-        self.assertFalse(targets & set(range(start + 1, b.end)))
-        fast, slow = emu.Threads(d, 13), emu.Threads(d, 13)
-        fast.r[:] = slow.r[:] = np.random.default_rng(start).choice(values, fast.r.shape)
-        fast.mask = slow.mask = np.arange(13) % 3 != 0
-        emu.exec_block(fast, b)
-        with np.errstate(all="ignore"):
-          for i in prog[start:b.end]:
-            for k in range(i.iterations if type(i) in emu.EXEC else 0): emu.EXEC[type(i)](slow, i, k)
-        np.testing.assert_equal(fast.r, slow.r)
-        checked += 1
-    self.assertGreater(checked, 0)
-
-  @unittest.skipUnless(DEV.interface.startswith("MOCK"), "MOCK only")
   def test_unsupported(self):
-    from tinygrad.engine.realize import lower_and_compile, run_linear
+    from tinygrad.engine.realize import lower_and_compile, compile_linear
     from test.mockgpu.qcom.qcomdriver import EmulatorError
-    linear = lower_and_compile(((Tensor.empty(4) + 1).contiguous() * 2).schedule_linear())
+    linear, externs = ((Tensor.empty(4) + 1).contiguous() * 2).linear_with_externs()
+    linear = lower_and_compile(linear)
     binary = next(u for u in linear.toposort(enter_calls=True) if u.op is Ops.BINARY)
     lib = binary.arg.replace((mesa.OPC_END << 55).to_bytes(8, "little"), (mesa.OPC_KILL << 55).to_bytes(8, "little"), 1)
     with self.assertRaisesRegex(EmulatorError, "OPC_KILL is not emulated"):
-      run_linear(linear.substitute({binary: binary.replace(arg=lib)}, enter_calls=True))
+      Tensor.run(compile_linear(linear.substitute({binary: binary.replace(arg=lib)}, enter_calls=True)), externs)
       Device[Device.DEFAULT].synchronize()
     np.testing.assert_equal((Tensor([1., 2.]) + 1).numpy(), [2., 3.])
 
