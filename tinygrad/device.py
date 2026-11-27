@@ -1,18 +1,16 @@
 from __future__ import annotations
 from dataclasses import dataclass, replace, field
 from collections import defaultdict
-from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self, TYPE_CHECKING
+from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self
 import importlib, inspect, functools, itertools, pathlib, os, contextlib, atexit, pickle, decimal, mmap, time, statistics
 from tinygrad.helpers import mv_address, LRU, getenv, DEBUG, GlobalCounters, PROFILE, temp, colored
 from tinygrad.helpers import Context, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
 from tinygrad.helpers import select_by_name, select_first_inited, DEV, TracingKey, size_to_str, pluralize, unwrap, round_up, is_numpy_ndarray
-from tinygrad.helpers import cpu_profile, perf_counter_us, HCQ_RUNTIME_DEV, is_disk_device, canonicalize_device_name, Target
+from tinygrad.helpers import cpu_profile, perf_counter_us, HCQ_RUNTIME_DEV, is_disk_device, canonicalize_device_name, Target, to_tuple, NODE_NDEVS
 from tinygrad.dtype import dtypes
 from tinygrad.runtime.support.memory import MMIOInterface
-from tinygrad.renderer import Renderer
-if TYPE_CHECKING:
-  from tinygrad.renderer import Compiler, TinyELF
-  from tinygrad.uop.ops import PatternMatcher
+from tinygrad.renderer import Renderer, Compiler, TinyELF
+from tinygrad.uop.ops import PatternMatcher
 
 # **************** Device ****************
 
@@ -42,10 +40,12 @@ class _Device:
     if DEBUG >= 1: print(f"opened device {ix} from pid:{os.getpid()} as DEV={self.target_for(ix)}")
     return ret
   def target_for(self, device:str, cv=DEV) -> Target:
-    if not (t:=cv.target(device.split(':')[0])).arch and device not in self._opened_devices: self[device]
-    if (d:=self._opened_devices.get(device)) is None: return t
-    return replace(t, arch=t.arch or d.arch or "", props=",".join(f"{k}={v}" for k, v in (d.props | t.opts).items()))
-  def renderer_for(self, device:str, cv=DEV) -> Renderer: return select_renderer(replace(self.target_for(device, cv), props=""))
+    if (t:=cv.target(device.split(':')[0])).arch: return t
+    try: d = self._opened_devices.get(device:=self.canonicalize(device)) or self[device]
+    except Exception as e: raise RuntimeError(f"no target for {device}: set its arch in DEV, or open it") from e
+    iface = type(d.iface).__name__[:-5] if hasattr(d, "iface") else ""
+    return replace(t, arch=d.arch or "", interface=t.interface or iface, props=",".join(f"{k}={v}" for k, v in (d.props | t.opts).items()))
+  def renderer_for(self, device:str, cv=DEV) -> Renderer: return select_renderer(cv.target((t:=self.target_for(device, cv)).device, arch=t.arch))
   @property
   def default(self) -> Compiled: return self[self.DEFAULT]
   def get_available_devices(self) -> Iterator[str]:
@@ -66,6 +66,19 @@ class _Device:
     except StopIteration as exc: raise RuntimeError("no usable devices") from exc
 Device: _Device = _Device()
 atexit.register(lambda: [Device[dn].finalize() for dn in tuple(Device._opened_devices)])
+def node_of(dev:str) -> str:
+  if dev.startswith("CPU:") and dev.count(":") == 2: return dev[4:]
+  nodes = [n if n == "local" or ":" in n else f"{n}:6667" for n in getenv("REMOTE", "").split(",") if n]
+  if dev.split(":")[0] not in HCQ_DEVS or not nodes: return "local"
+  assert len(nodes) == 1 or NODE_NDEVS, f"REMOTE={getenv('REMOTE', '')} has several nodes, set NODE_NDEVS to the gpus of one"
+  return nodes[int(dev.split(":")[1]) // NODE_NDEVS.value if ":" in dev and NODE_NDEVS else 0]
+def host_of(dev:str) -> str:
+  if dev.split(":")[0] == "NULL": return dev
+  return HCQ_RUNTIME_DEV.device if (node:=node_of(dev)) == "local" else f"CPU:{node}"
+def peer_group(dev:str) -> str:
+  if (node:=node_of(dev:=Device.canonicalize(dev))) != "local": return node
+  return dev if (iface:=Device.target_for(dev).interface).endswith("USB") else "PCI" if iface.endswith("PCI") else dev.split(":")[0]
+def is_iface_usb(dev:str|tuple[str, ...]) -> bool: return Device.target_for(Device.canonicalize(to_tuple(dev)[0])).interface.endswith("USB")
 
 # **************** Profile ****************
 
@@ -229,10 +242,11 @@ class Buffer:
   def copy_from(self, src:Buffer) -> Buffer:
     assert self.nbytes == src.nbytes, f"copy size mismatch, {self.nbytes} != {src.nbytes}"
     assert self.is_allocated() and src.is_allocated(), "copy requires allocated buffers"
-    from tinygrad.engine.realize import run_linear
+    from tinygrad.engine.realize import compile_linear, link_linear, run_linear
     from tinygrad.uop.ops import UOp, Ops
     du, su = UOp.from_buffer(self, dtypes.uint8), UOp.from_buffer(src, dtypes.uint8)
-    run_linear(UOp(Ops.LINEAR, src=(du.store_call(su),)), update_stats=False)
+    linear = compile_linear(UOp(Ops.LINEAR, src=(du.as_extern(0).store_call(su.as_extern(1)),)), cache=True)
+    run_linear(link_linear(linear, inputs:=[du, su]), input_uops=inputs, update_stats=False)
     return self
 
   def view(self, nbytes:int, offset:int) -> Buffer:
@@ -361,10 +375,7 @@ class Compiled:
     self.prof_ents:dict[tuple[Buffer, int], ProfileGraphEntry] = {} # (a batch's timestamps, start slot) -> entry, read at synchronize
 
   @property
-  def has_copy_queue(self) -> bool: return True
-
-  @property
-  def host(self) -> str: return f"CPU:{self.peer_group[7:]}" if self.peer_group.startswith("remote:") else HCQ_RUNTIME_DEV.device
+  def host(self) -> str: return host_of(self.device)
 
   @property
   def renderer(self) -> Renderer: return Device.renderer_for(self.device)

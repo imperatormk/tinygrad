@@ -3,6 +3,7 @@ from dataclasses import replace
 from typing import cast
 from tinygrad.helpers import OSX, mv_address, flatten, to_tuple, unwrap, ceildiv
 from tinygrad.device import BufferStorage, MMIOInterface, Compiled, Allocator, Buffer, BufferSpec, Device, HCQ_RUNTIME_DEV
+from tinygrad.device import is_iface_usb
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, uopfunc
 from tinygrad.runtime.support.hcq2 import ccall, ins, patch
@@ -84,8 +85,8 @@ CHUNK_SZ, READ_SZ, SLOTS, RING_ENTRIES = 64 << 20, 1 << 20, 2, 256
 SLOT_SZ, STAGE_SZ = CHUNK_SZ + 4096, 4096 + SLOTS * (CHUNK_SZ + 4096) # +4096: reads are page aligned. stage: a page of counts, then the slots
 
 @uopfunc
-def disk_read(file:UOp, srcs:UOp, counts:UOp, rings:UOp, sqes:UOp) -> UOp: # srcs: [address in the file's mmap, bytes] per copy
-  fd, p = unwrap(uring())[:2]
+def disk_read(file:UOp, srcs:UOp, counts:UOp, fd:UOp, rings:UOp, sqes:UOp) -> UOp: # srcs: [address in the file's mmap, bytes] per copy
+  p = unwrap(uring())[1]
   file, srcs, counts, rings, sqes = (b.replace(arg=replace(b.arg, volatile=True, device=None)) for b in (file, srcs, counts, rings, sqes))
 
   # for each copy
@@ -105,7 +106,7 @@ def disk_read(file:UOp, srcs:UOp, counts:UOp, rings:UOp, sqes:UOp) -> UOp: # src
 
   # submits the reads, waits for all, marks the chunk read
   to_submit = nreads.cast(dtypes.int).after(rings.after(queued)[p.sq_off.tail // 4].store((tail + nreads).cast(dtypes.uint32)))
-  done = ccall(libc.syscall, io_uring.NR_io_uring_enter, fd, to_submit, to_submit, io_uring.IORING_ENTER_GETEVENTS, 0, 0)
+  done = ccall(libc.syscall, io_uring.NR_io_uring_enter, fd.index(0).load(), to_submit, to_submit, io_uring.IORING_ENTER_GETEVENTS, 0, 0)
   reaped = rings.after(done)[p.cq_off.head // 4].store(rings.after(done)[p.cq_off.tail // 4])
   return counts.after(reaped)[0].store(n + 1).end(chunk).end(copy).sink()
 
@@ -114,12 +115,13 @@ def disk_read(file:UOp, srcs:UOp, counts:UOp, rings:UOp, sqes:UOp) -> UOp: # src
 
 def is_disk_read(c:UOp) -> bool:
   dev, src = [to_tuple(b.device)[0] for b in c.src[1:3]] if c.op is Ops.CALL and c.body.op is Ops.STORE else ("", "")
-  return src.startswith("DISK:") and not src.startswith("DISK:shm:") and Device[dev].has_copy_queue and not dev.startswith("NULL") and bool(uring()) \
-    and not getattr(Device[dev], "is_usb", False)
+  return src.startswith("DISK:") and not src.startswith("DISK:shm:") and not dev.startswith("NULL") and bool(uring()) \
+    and bool(Device.target_for(dev).get("copy", 1)) and not is_iface_usb(dev)
 
 def disk_copy_rewriter(s:UOp) -> UOp|None:
   lin = s.without_after.body
   if not (copies:=[c for c in lin.src if is_disk_read(c)]): return None
+  fd = UOp.extern((1,), dtypes.int32, HCQ_RUNTIME_DEV.device, "uring_fd") # the ring is this process', its fd links too
   rings = UOp.extern((unwrap(uring())[2].nbytes // 4,), dtypes.uint32, HCQ_RUNTIME_DEV.device, "uring_rings")
   sqes = UOp.extern((8 * RING_ENTRIES,), dtypes.uint64, HCQ_RUNTIME_DEV.device, "uring_sqes")
 
@@ -136,7 +138,7 @@ def disk_copy_rewriter(s:UOp) -> UOp|None:
   done, off, gpu_ops = s, 0, collections.defaultdict[UOp, list[UOp]](list)
   for disk, grp in itertools.groupby(range(len(copies)), lambda k: to_tuple(copies[k].src[2].device)[0]):
     file, ks = UOp.extern((2,), dtypes.uint64, disk, "disk_info"), list(grp)
-    done = disk_read(file, srcs[2 * ks[0]:2 * ks[-1] + 2], counts.after(done), rings, sqes)
+    done = disk_read(file, srcs[2 * ks[0]:2 * ks[-1] + 2], counts.after(done), fd, rings, sqes)
 
   # gpu part
   for k, c in enumerate(copies):
@@ -158,12 +160,15 @@ def shared(fd:int, at:int, n:int) -> Buffer: # n bytes of memory the kernel shar
 @functools.cache
 def uring() -> tuple[int, io_uring.struct_io_uring_params, Buffer, Buffer]|None: # fd, offsets, the rings (heads, tails, cqes), the sqes
   if sys.platform != "linux" or hasattr(sys, "getandroidapilevel"): return None
-  p = io_uring.struct_io_uring_params(flags=io_uring.IORING_SETUP_NO_SQARRAY)  # type: ignore[unreachable]
+  p = io_uring.struct_io_uring_params(flags=io_uring.IORING_SETUP_NO_SQARRAY)
   if (fd:=libc.syscall(io_uring.NR_io_uring_setup, RING_ENTRIES, ctypes.byref(p))) < 0: return None
   return fd, p, shared(fd, io_uring.IORING_OFF_SQ_RING, p.cq_off.cqes + 16 * p.cq_entries), shared(fd, io_uring.IORING_OFF_SQES, 64 * RING_ENTRIES)
 
 @functools.cache
 def _stage(dev) -> Buffer: return Buffer(Device[dev].host, STAGE_SZ, options=BufferSpec(cpu_access=True), initial_value=bytes(STAGE_SZ))
 
+@functools.cache
+def _uring_fd() -> Buffer: return Buffer(HCQ_RUNTIME_DEV.device, 4, initial_value=struct.pack("i", unwrap(uring())[0]))
+
 Compiled.link_bufs |= {"disk_info": lambda b: cast(DiskDevice, Device[b.device]).info, "disk_stage": lambda b: _stage(b.device),
-                       "uring_rings": lambda b: unwrap(uring())[2], "uring_sqes": lambda b: unwrap(uring())[3]}
+                       "uring_fd": lambda b: _uring_fd(), "uring_rings": lambda b: unwrap(uring())[2], "uring_sqes": lambda b: unwrap(uring())[3]}

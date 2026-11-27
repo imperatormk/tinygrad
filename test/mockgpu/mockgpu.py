@@ -1,6 +1,6 @@
-import ctypes, time, os, builtins, fcntl, typing
+import ctypes, time, os, builtins, fcntl, typing, traceback, sys
 from tinygrad.helpers import DEV, dedup, to_tuple, round_up
-from tinygrad.device import Compiled, Device
+from tinygrad.device import Compiled, host_of
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, NativeInfo
 from tinygrad.runtime.support.system import FileIOInterface, System
@@ -16,7 +16,19 @@ drivers = [cls() for t in DEV.value if (cls:={"MOCKPCI+AMD": AMDriver, "MOCKKFD+
                                               "MOCK+NV": NVDriver, "MOCK+QCOM": QCOMDriver}.get(f"{t.interface}+{t.device}"))]
 tracked_fds: dict[int, typing.Any] = {}
 
-@ctypes.CFUNCTYPE(None, ctypes.c_uint64)
+def mock_callback(fn):
+  @ctypes.CFUNCTYPE(None, ctypes.c_uint64)
+  def callback(addr):
+    try: fn(addr)
+    except BaseException:
+      # ctypes cannot propagate exceptions to the compiled submit/wait loop. Don't leave it waiting on a failed queue.
+      try:
+        traceback.print_exc()
+        sys.stderr.flush()
+      finally: os._exit(1)
+  return callback
+
+@mock_callback
 def mockgpu_doorbell(addr:int): # compiled stores aren't tracked, so the submits report their doorbells
   for st,en,_,wcb in [x for d in drivers for x in d.tracked_addresses]:
     if st <= addr < en: wcb(None, addr - st)
@@ -29,13 +41,13 @@ setattr(libc.dll, "mockgpu_ioctl", mockgpu_ioctl)
 
 mocked = {t.device for t in DEV.value if t.interface.startswith("MOCK")}
 def hook_doorbells(s:UOp) -> UOp|None:
-  hooks = tuple(UOp.native("mockgpu_doorbell").call(b.after(c).getaddr(Device[d].host)) for c in s.toposort() if c.op is Ops.CALL
+  hooks = tuple(UOp.native("mockgpu_doorbell").call(b.after(c).getaddr(host_of(d))) for c in s.toposort() if c.op is Ops.CALL
                 for b in c.src[1:] if b.op is Ops.EXTERN and "doorbell" in str(b.arg.name) and (d:=to_tuple(b.device)[0]).split(":")[0] in mocked)
   return None if all(h in s.src for h in hooks) else s.replace(src=tuple(dedup(s.src + hooks)))
 def hook_ioctl(f:UOp) -> UOp|None: return f.replace(arg=NativeInfo("mockgpu_ioctl")) if "QCOM" in mocked else None
 Compiled.pm_lower += PatternMatcher([(UPat(Ops.SINK, name="s"), hook_doorbells), (UPat.native("ioctl", name="f"), hook_ioctl)])
 
-@ctypes.CFUNCTYPE(None, ctypes.c_uint64)
+@mock_callback
 def mockgpu_progress(_:int): # compiled spin loops wait on the gpus, which run only when called
   for d in drivers: d.progress()
 setattr(libc.dll, "mockgpu_progress", mockgpu_progress)
@@ -52,7 +64,7 @@ def emit_kernel_info(ctx:HWQueue, prg:UOp) -> None:
     from tinygrad.viz.serve import get_elf_section
     name = prg.src[0].arg.name.encode() + b"\x00"
     text = get_elf_section(prg.src[3].arg, ".text").header
-    text_size = text.sh_addr + text.sh_size - _amd_program_image(ctx.dev, prg.src[3].arg)[0].entry_point_offset
+    text_size = text.sh_addr + text.sh_size - _amd_program_image(ctx.devs[0], prg.src[3].arg)[0].entry_point_offset
     ctx.pkt3(ctx.pm4.PACKET3_NOP, *memoryview(name.ljust(round_up(len(name), 4), b"\x00")).cast("I"), text_size)
 
 HWQueue.q_rewrite = PatternMatcher([
@@ -158,4 +170,4 @@ class MockFileIOInterface(FileIOInterface):
   @staticmethod
   def eventfd(initval, flags=None): NotImplementedError()
 
-System.lock_memory = lambda addr, size: None # type: ignore[method-assign,has-type] # nothing dmas from host memory, like MAP_LOCKED in anon_mmap
+System.lock_memory = lambda addr, size: None # type: ignore[has-type] # nothing dmas from host memory, like MAP_LOCKED in anon_mmap

@@ -4,6 +4,7 @@ from dataclasses import replace, dataclass, field
 from collections import defaultdict, Counter
 from tinygrad.helpers import dedup, pluralize, unwrap, to_tuple, Context, panic, partition, to_name, flatten, DEBUG, VIZ, ALL2ALL, PROFILE
 from tinygrad.device import Device, Buffer, BufferSpec, Compiled, HCQ_RUNTIME_DEV, HCQ_DEVS, HOST_DEVS, UVM_DEVS, ProfileProgramEvent
+from tinygrad.device import is_iface_usb, peer_group, host_of
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, GroupOp, graph_rewrite, rewrite_group, exec_alu, uopfunc
 from tinygrad.uop.ops import pm_renumber_slots, CountCtx, sint_to_uop, pm_flatten_linear, AxisType
 from tinygrad.dtype import dtypes, AddrSpace, truncate
@@ -56,7 +57,7 @@ def make_program(prg:UOp, size:int, device:str) -> UOp:
   return UOp.alloc((size,), dtypes.u8, slot, device=device, name="program")
 
 def make_submit(*cmds:UOp, dev:str, queue:str, deps:tuple[UOp, ...]) -> UOp: # a submit calls its commands on a queue, after deps
-  kind = to_name(dev.split(":")[0], queue.split(":")[0], "submit") # nv_compute_submit: the backend matches the kind
+  kind = to_name(Device.get_class(dev).__name__[:-6], queue.split(":")[0], "submit") # nv_compute_submit: the backend matches the kind
   q = UOp.param(0, dtypes.u8, 1, dev, name=queue) # the queue instance: its device and name
   return UOp.sink(*cmds, arg=KernelInfo(kind)).call(q).after(*deps)
 
@@ -159,13 +160,7 @@ def cstruct(struct_t:type[Struct], **fields:UOp|int) -> UOp:
   buf = UOp.alloc((ctypes.sizeof(struct_t),), dtypes.u8, device=HCQ_RUNTIME_DEV.device, name=struct_t.__name__)
   return patch(buf, rows, bytes(ctypes.sizeof(struct_t)))
 
-# **** prep: externs, unwrap multi, staging copies
-
-def replace_buffer(ctx:tuple[list[UOp], dict[UOp, int]], b:UOp) -> UOp:
-  bufs, slots = ctx
-  if slots.setdefault(b, len(bufs)) == len(bufs): bufs.append(b)
-  return b.replace(op=Ops.EXTERN, arg=replace(b.arg, slot=slots[b], buffer=None))
-pm_replace_buffers = PatternMatcher([(UPat(Ops.BUFFER, name="b"), lambda ctx, b: replace_buffer(ctx, b))])
+# **** prep: unwrap multi, staging copies
 
 def unwrap_call(call:UOp) -> UOp|None:
   if (n:=max([len(to_tuple(a.device)) for a in get_call_arg_uops(call)], default=1)) == 1: return None
@@ -177,10 +172,9 @@ pm_unwrap_multi = PatternMatcher([(UPat(Ops.CALL, name="call"), unwrap_call)])
 
 def split_rdma(call:UOp, dst:UOp, src:UOp) -> UOp|None:
   devs = [to_tuple(b.device)[0] for b in (dst, src)]
-  if Device[devs[0]].host == Device[devs[1]].host: return None # not 2 nodes
+  if host_of(devs[0]) == host_of(devs[1]): return None # not 2 nodes
 
-  from tinygrad.runtime.support.system import PCIIfaceBase
-  if not all(isinstance(getattr(Device[d], "iface", None), PCIIfaceBase) for d in devs): return None
+  if not all(Device.target_for(d).interface.endswith("PCI") for d in devs): return None
   from tinygrad.runtime.ops_rdma import rdma_nic_for
   if None in (nics:=[rdma_nic_for(Device[d], Device[min(devs)]) for d in devs]): return None
 
@@ -196,16 +190,20 @@ def stage_copy(call:UOp, dst:UOp, src:UOp) -> UOp|None:
   device = enqueued[0]
 
   from tinygrad.runtime.ops_disk import is_disk_read
-  dev, host, usb_memcpys = Device[device], Device[device].host, getattr(Device[device], "is_usb", False)
+  host, peer, usb_memcpys = host_of(device), peer_group(device), is_iface_usb(device)
   mappable = {"CPU", "PYTHON"} | ({"NPY", "DISK"} if usb_memcpys else {"DISK"} if is_disk_read(call) else set()) # ops_disk stages it in the batch
-  if device != host and not all(Device[d].peer_group == dev.peer_group or (d.split(":")[0] in mappable and Device[d].host == host) for d in devs):
+  if device != host and not all(peer_group(d) == peer or (d.split(":")[0] in mappable and host_of(d) == host) for d in devs):
     stage = UOp.alloc(src.max_shape, src.dtype, int.from_bytes(call.key[:8], "little"), device=host)
     return UOp(Ops.LINEAR, src=(stage.store_call(src), dst.store_call(stage)))
 
-  if Device[device].has_copy_queue: return None
-  out, inp = (UOp.param(i, dtypes.u8, b.nbytes(), device=device) for i, b in enumerate((dst, src)))
+  if Device.target_for(device).get("copy", 1): return None
+  # A kernel runs on its first buffer's device. For a push, slot 0 must be the source, not the destination.
+  push = device != devs[0]
+  args = (src, dst) if push else (dst, src)
+  out = UOp.param(1 if push else 0, dtypes.u8, dst.nbytes(), device=device)
+  inp = UOp.param(0 if push else 1, dtypes.u8, src.nbytes(), device=device)
   ast = out.index(r:=UOp.range(src.nbytes(), 0, AxisType.WEAK)).store(inp.index(r).load()).end(r).sink(arg=KernelInfo())
-  return lower_and_compile(call.replace(src=(ast, *call.src[1:])))
+  return lower_and_compile(call.replace(src=(ast, *args)))
 
 pm_insert_copy_staging = PatternMatcher([
   (UPat(Ops.CALL, src=(UPat(Ops.STORE), UPat(name="dst"), UPat(name="src")), name="call", allow_any_len=True), split_rdma),
@@ -246,7 +244,8 @@ class BatchCtx:
 
   def __post_init__(self):
     # the other devices whose memory a call touches: a usb gpu can't reach host memory
-    reach = [HCQ_DEVS if getattr(Device[d], "is_usb", False) else HCQ_DEVS | HOST_DEVS for _, d, _ in self.batch]
+    usb = {d: is_iface_usb(d) for d in {d for _, d, _ in self.batch}}
+    reach = [HCQ_DEVS if usb[d] else HCQ_DEVS | HOST_DEVS for _, d, _ in self.batch]
     arg_devs = [{Device.canonicalize(x) for b in get_call_arg_uops(c) for x in to_tuple(b.device)} for c, _, _ in self.batch]
     touched = [{x for x in xs if all_devices_in(x, r)} - {d} for xs, r, (_, d, _) in zip(arg_devs, reach, self.batch)]
 
@@ -365,8 +364,8 @@ def sched_batches(l:UOp, profile:bool) -> UOp:
   srcs:list[UOp] = []
   for hcq, grp in itertools.groupby(zip(l.src, devs), key=lambda e: bool(e[1])):
     run = list(grp)
-    peer_groups = dedup([Device[d[0]].peer_group for _, d in run if d])
-    batches = [[(c, d[0], queue_for(c)) for c, d in run if Device[d[0]].peer_group == pg] for pg in peer_groups]
+    peers = {d: peer_group(d) for d in dedup(d[0] for _, d in run if d)}
+    batches = [[(c, d[0], queue_for(c)) for c, d in run if peers[d[0]] == pg] for pg in dedup(peers.values())]
     if hcq: srcs += [_finalize_batch(BatchCtx(batch, profile), batch is not batches[-1]) for batch in batches]
     else: srcs += [c for c, _ in run]
   return l.replace(src=tuple(srcs))
@@ -400,7 +399,6 @@ class HWQueue:
     call, self.deps = submit.src[0], submit.src[1:]
     self.lin, q = call.body, call.src[1]
     self.devs, self.queue = (q.device,), q.arg.name
-    self.dev = Device[self.devs[0]]
     self.blob, self.patches = bytearray(), list[tuple[int|UOp, UOp]]()
 
   def q(self, *words:UOp|int) -> int:
@@ -533,7 +531,8 @@ def bufferize_buf(ctx:LinkCtx, b:UOp) -> UOp:
 
 def resolve_extern(ctx:LinkCtx, b:UOp) -> UOp:
   if b.arg.name is None:
-    a = ctx.inputs[b.arg.slot]
+    if (i:=b.arg.slot) >= len(ctx.inputs) or (a:=ctx.inputs[i]).as_extern(i) is not b:
+      raise RuntimeError(f"extern {i} must match its EXTERN, {b.dtype} {b.shape} on {b.device}, got {ctx.inputs[i:i+1] or 'nothing'}")
     return UOp.const(a.arg.val, b.dtype) if a.is_bound_var else a
   owned = Compiled.link_bufs[b.arg.name if b.arg.name in Compiled.link_bufs else to_name(b.device, b.arg.name)]
   return UOp.from_buffer(owned if isinstance(owned, Buffer) else owned(b), b.dtype, HCQ_RUNTIME_DEV.device)
@@ -574,21 +573,13 @@ pm_resolve_link = PatternMatcher([
 
 # **** compile and link
 
-hcq_compile_cache:dict[tuple[UOp, bool, bool], UOp] = {} # eager templates: a buffer-free linear (uops are hash-consed) to its compiled form
-
-@rewrite_group(lambda linear,input_uops,profile,cache=False,ret=None: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
-def hcq_compile(linear:UOp, input_uops:list[UOp]|None, profile:bool, cache:bool=False) -> UOp:
+@rewrite_group(lambda linear,profile,ret=None: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
+def hcq_compile(linear:UOp, profile:bool) -> UOp:
   if any(getattr(c.without_after.arg, "hcq", None) is not None for c in linear.src): return linear # compiled already
 
-  if cache and input_uops is not None:
-    slots = {u:i for i,u in reversed(tuple(enumerate(input_uops)))}
-    linear = graph_rewrite(linear, pm_replace_buffers, ctx=(input_uops, slots), walk=True, name="replace buffers")
   linear = graph_rewrite(linear, pm_unwrap_multi+pm_insert_copy_staging+pm_flatten_linear, name="prep calls")
-  if cache and input_uops is not None and (cached:=hcq_compile_cache.get(key:=(linear, profile, ALL2ALL >= 1))) is not None: return cached
   lin = graph_rewrite(sched_batches(linear, profile), pm_lower_call, walk=True, name="lower call")
-  with Context(EMULATED_DTYPES=""): final_linear = lower_and_compile(lin, verbose=DEBUG>=3)
-  if cache and input_uops is not None and final_linear is not linear: hcq_compile_cache[key] = final_linear
-  return final_linear
+  with Context(EMULATED_DTYPES=""): return lower_and_compile(lin, verbose=DEBUG>=3)
 
 @rewrite_group(lambda _,input_uops=None,ret=None: f"HCQ Link {pluralize('Kernel', len(ret.src))}")
 def hcq_link(linear:UOp, input_uops:list[UOp]|None=None) -> UOp:

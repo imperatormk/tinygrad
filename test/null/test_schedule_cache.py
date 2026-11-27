@@ -12,8 +12,8 @@ class TestScheduleCache(unittest.TestCase):
     x = Tensor.ones(10).contiguous().realize()
 
     t = x + Tensor(v.bind(42))
-    _, var_vals = t.linear_with_vars()
-    self.assertEqual(var_vals, {'pos': 42})
+    _, externs = t.linear_with_externs()
+    self.assertEqual({x.expr: x.arg.val for x in externs if x.is_bound_var}, {'pos': 42})
 
   def test_view_offset_not_in_cache_key(self):
     # every use of a contiguous view is the same input, so slices at different offsets share one schedule
@@ -22,7 +22,7 @@ class TestScheduleCache(unittest.TestCase):
     for start in (1, 2, 3):
       v = x[start:start+4]
       (v.contiguous() + v).realize()
-      self.assertEqual(len(schedule_cache), 1)
+      self.assertEqual(sum(isinstance(k, bytes) for k in schedule_cache), 1)
 
   def test_disable_schedule_cache(self):
     schedule_cache.clear()
@@ -33,7 +33,7 @@ class TestScheduleCache(unittest.TestCase):
     with Context(SCACHE=1):
       schedule_one()
       schedule_one()
-    self.assertEqual(len(schedule_cache), 1)
+    self.assertEqual(len(schedule_cache), 2)  # one body schedule and one final LINEAR
 
     # test read
     with Context(PROFILE=1):

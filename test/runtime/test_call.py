@@ -3,12 +3,13 @@ import numpy as np
 from tinygrad import Tensor, function, Device, Variable
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.uop.ops import UOp, Ops, KernelInfo, AxisType, uopfunc
-from tinygrad.engine.realize import run_linear, get_runtime
+from tinygrad.engine.realize import get_runtime
 from tinygrad.codegen import to_program
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.helpers import getenv
 from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.renderer.llvmir import LLVMRenderer
+from test.helpers import run_schedule, bound_schedule
 
 def sched_key(t:Tensor): return t.export()[0].key
 
@@ -18,7 +19,7 @@ class TestCall(unittest.TestCase):
     out = Tensor.empty(1, dtype=dtypes.int).realize()
     p, n = UOp.param(0, dtypes.int, (1,)), UOp.param(1, dtypes.int, name="n", addrspace=AddrSpace.ALU)
     prg = to_program(p.index(UOp.const(0)).store(n).sink(arg=KernelInfo("named_scalar")), Device[Device.DEFAULT].renderer)
-    run_linear(UOp(Ops.LINEAR, src=(prg.call(out.uop.buf_uop, UOp.const(42, dtypes.int)),)))
+    run_schedule(UOp(Ops.LINEAR, src=(prg.call(out.uop.buf_uop, UOp.const(42, dtypes.int)),)))
     self.assertEqual(out.item(), 42)
 
   def test_scalar_arg_after_call(self):
@@ -371,7 +372,7 @@ class TestArgOrder(unittest.TestCase):
   def make_intersperse_call(self, x, precompile=False):
     # the output is at position 0, the input (param slot 1) at position 1 in the call's args
     val = UOp.param(1, x.dtype, x.shape, self._dev(x)).reshape(x.shape) * 2
-    return UOp.call_with_outputs((val,), x.uop, name='t', output_pos=(0,), precompile=precompile)
+    return UOp.call_with_outputs((val,), x.uop, output_pos=(0,), precompile=precompile)
 
   def test_intersperse_returned(self):
     x = Tensor.arange(3, dtype=dtypes.int).realize()
@@ -402,7 +403,7 @@ class TestArgOrder(unittest.TestCase):
     x.requires_grad = True
     p1 = UOp.param(1, dtypes.float, x.shape, self._dev(x))
     val = p1.reshape(x.shape) * p1.reshape(x.shape)
-    outs = UOp.call_with_outputs((val,), x.uop, name='t', output_pos=(0,))
+    outs = UOp.call_with_outputs((val,), x.uop, output_pos=(0,))
     y = Tensor(outs[0], device=x.device)
     y.sum().backward()
     np.testing.assert_equal(x.grad.numpy(), [2, 4, 6])
@@ -746,7 +747,7 @@ class TestCallInKernel(unittest.TestCase):
       return A[i].store(tmp[i].after(plus2(tmp[i], A[i]))).end(i).sink(arg=KernelInfo(name="test_kernel", opts_to_apply=()))
 
     x = Tensor.custom_kernel(Tensor.arange(4).clone().realize(), fxn=kernel)[0]
-    run_linear(lin:=x.schedule_linear())
+    run_schedule(lin:=bound_schedule(x))
 
     prg = to_program(lin.src[0].body, Device[Device.DEFAULT].renderer)
     assert "+2" not in prg.src[2].arg, f"found callee body in caller kernel {prg.src[2].arg}"
@@ -757,10 +758,10 @@ class TestCallInKernel(unittest.TestCase):
 
     # launch a different caller with the same callee
     x = Tensor.custom_kernel(Tensor.arange(5).clone().realize(), fxn=lambda A: kernel(A, extra=True))[0]
-    run_linear(lin:=x.schedule_linear())
+    run_schedule(lin:=bound_schedule(x))
     prg2 = to_program(lin.src[0].body, Device[Device.DEFAULT].renderer).src[1]
-    self.assertIs(call.body, next(u.body for u in prg2.src if u.op is Ops.CALL and u.arg.name == "plus2"))
-    self.assertIs(first_binary, next(u.body.src[3] for u in prg2.src if u.op is Ops.CALL and u.arg.name == "plus2"))
+    self.assertIs(call.body, next(u.body for u in prg2.src if u.op is Ops.CALL and u.body.src[0].arg.name == "plus2"))
+    self.assertIs(first_binary, next(u.body.src[3] for u in prg2.src if u.op is Ops.CALL and u.body.src[0].arg.name == "plus2"))
     self.assertIs(call_runtime, get_runtime(Device.DEFAULT, call.body))
     self.assertListEqual(x.tolist(), Tensor.arange(5).add(2).tolist())
 

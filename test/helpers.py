@@ -1,4 +1,4 @@
-import os, sys, gc, time, struct, functools, unittest, contextlib
+import os, sys, gc, time, struct, unittest, contextlib
 from dataclasses import replace
 from typing import Any, Callable, Iterator
 import numpy as np
@@ -9,11 +9,12 @@ from tinygrad.tensor import _to_np_dtype
 from tinygrad.codegen import to_program
 from tinygrad.dtype import DType, truncate, AddrSpace
 from tinygrad.nn.state import get_parameters
-from tinygrad.helpers import T, Target, DEV, DEBUG, Context, GlobalCounters
+from tinygrad.helpers import T, Target, DEV, DEBUG, Context, GlobalCounters, VALIDATE_WITH_CPU
 from tinygrad.renderer import Renderer, TinyELF
 from tinygrad.codegen import full_rewrite_to_sink, linearize_cleanups
 from tinygrad.codegen.late.linearizer import linearize
-from tinygrad.engine.realize import compile_linear
+from tinygrad.engine.realize import compile_linear, link_linear, run_linear
+from tinygrad.engine.jit import bind_export
 
 # decorator to skip slow tests by default, run with RUN_SLOW=1 to include them
 slow = unittest.skipUnless(os.getenv("RUN_SLOW"), "slow test, set RUN_SLOW=1 to run")
@@ -45,14 +46,21 @@ class KernelCountException(Exception):
     self.expected, self.got = expected, got
     super().__init__(f"expected {expected}, got {got}")
 
+def bound_schedule(*ts:Tensor) -> UOp: return bind_export(*Tensor.linear_with_externs(*ts))
+
+def run_schedule(linear:UOp, externs:tuple[UOp, ...]=(), var_vals:dict[str, int]|None=None, update_stats=True, wait=False) -> None:
+  var_vals = {**{f"e{i}": x.arg.val for i,x in enumerate(externs) if x.is_bound_var}, **(var_vals or {})}
+  linked = link_linear(compile_linear(linear, validate=VALIDATE_WITH_CPU), list(externs))
+  run_linear(linked, var_vals, externs, update_stats=update_stats, wait=wait)
+
 def check_schedule(t:Tensor|list[Tensor]|UOp, allowed:int, to_prerealize:list[Tensor]|None=None, filter_sink=True):
   if to_prerealize:
     with Context(DEBUG=0, TRACK_MATCH_STATS=0): Tensor.realize(*to_prerealize)
-  if isinstance(t, Tensor): linear, var_vals = t.linear_with_vars()
-  elif isinstance(t, list) and isinstance(t[0], Tensor): linear, var_vals = Tensor.linear_with_vars(*t)
+  if isinstance(t, Tensor): linear, externs = t.linear_with_externs()
+  elif isinstance(t, list) and isinstance(t[0], Tensor): linear, externs = Tensor.linear_with_externs(*t)
   else:
     assert isinstance(t, UOp), f"can't schedule {t}"
-    linear, var_vals = Tensor(t).linear_with_vars()
+    linear, externs = Tensor(t).linear_with_externs()
   # test compiling the linear
   compile_linear(linear)
   kernel_cnt = sum((len(call.device) if isinstance(call.device, tuple) else 1)
@@ -64,7 +72,7 @@ def check_schedule(t:Tensor|list[Tensor]|UOp, allowed:int, to_prerealize:list[Te
         print("kernel", i+1)
         print(call.src[0])
     raise KernelCountException(allowed, kernel_cnt)
-  return linear, var_vals
+  return linear, externs
 
 @contextlib.contextmanager
 def measure_mem() -> Iterator[Callable[[], int]]:
@@ -162,15 +170,7 @@ def to_uops_list(u:list[UOp], ren=None) -> list[UOp]:
   assert ret[-1].op is Ops.SINK
   return ret
 
-def not_support_multi_device():
-  # CL and CUDA don't support multi device if in CI
-  return (Device.DEFAULT == "CL" and Device[Device.DEFAULT].count() < 2) or (Device.DEFAULT == "CUDA" and DEV.interface.startswith("MOCK"))
-
-def needs_second_gpu(fn):
-  @functools.wraps(fn)
-  def wrapper(self, *args, **kwargs):
-    # check if there's a second GPU, if not, skip multi tests
-    try: Tensor.zeros(10, device=f"{Device.DEFAULT}:1").contiguous().realize()
-    except Exception as e: self.skipTest(f"second device not available: {e}")
-    return fn(self, *args, **kwargs)
-  return wrapper
+def needs_devices(n:int):
+  # Only these backends use the device suffix to index a physical accelerator. CPU, Metal, etc. open logical devices.
+  device = Device.DEFAULT
+  return unittest.skipIf(device in ("AMD", "NV", "CUDA", "HIP", "CL") and Device[device].count() < n, f"needs {n} {device} devices")

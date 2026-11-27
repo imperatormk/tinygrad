@@ -4,15 +4,16 @@ from tinygrad import Device, Tensor, TinyJit, Variable, dtypes, GlobalCounters
 from tinygrad.device import Buffer
 from tinygrad.dtype import AddrSpace
 from tinygrad.helpers import Context
-from tinygrad.uop.ops import Ops, UOp, uopfunc
-from tinygrad.engine.realize import compile_linear, link_linear, lower_and_compile, run_linear
+from tinygrad.uop.ops import Ops, UOp, uopfunc, KernelInfo
+from tinygrad.engine.realize import compile_linear, link_linear, lower_and_compile, run_linear, compile_cache
 from tinygrad.renderer.cstyle import CStyleLanguage
 from tinygrad.renderer.llvmir import LLVMRenderer
 from tinygrad.runtime.autogen import libc
 from tinygrad.runtime.support.c import init_c_struct_t
 import tinygrad.runtime.support.hcq2 as hcq2
-from tinygrad.runtime.support.hcq2 import HCQ_DEVS, all_devices_in, hcq_compile_cache
+from tinygrad.runtime.support.hcq2 import HCQ_DEVS, all_devices_in
 from test.null.test_hcq2 import compiled_chain, lower_hcq
+from test.helpers import run_schedule
 
 def cpu_buf(size:int=1, dtype=dtypes.uint8, **kwargs) -> UOp: return UOp.alloc((size,), dtype, device="CPU", **kwargs)
 
@@ -24,7 +25,7 @@ class TestHCQ2Schedule(unittest.TestCase):
         out, compiled, inputs = compiled_chain(2, jit=jit, device=Device.DEFAULT)
         linked = link_linear(compiled, input_uops=inputs)
         before = tuple(inputs)
-        for linear in (compiled, linked): self.assertIs(compile_linear(linear, input_uops=inputs, cache=not jit), linear)
+        for linear in (compiled, linked): self.assertIs(compile_linear(linear, cache=not jit), linear)
         self.assertIs(link_linear(linked, input_uops=inputs), linked)
         self.assertEqual(tuple(inputs), before)
         run_linear(linked, input_uops=inputs, jit=True, wait=True)
@@ -36,9 +37,9 @@ class TestHCQ2Schedule(unittest.TestCase):
     ins = [(Tensor.full((23,), float(i)).contiguous().realize(), Tensor.full((23,), 2.0).contiguous().realize()) for i in range(6)]
     for a, b in ins[:3]: f(a, b).tolist() # warm the jit and the copyout
 
-    before = len(hcq_compile_cache)
+    before = len(compile_cache)
     for i, (a, b) in enumerate(ins[3:], 3): self.assertEqual(f(a, b).tolist(), [i * 3.0] * 23)
-    self.assertEqual(len(hcq_compile_cache), before)
+    self.assertEqual(len(compile_cache), before)
 
   def test_jit_symbolic(self):
     @TinyJit
@@ -53,10 +54,10 @@ class TestHCQ2Schedule(unittest.TestCase):
     new.host[:] = bytes(range(256)) * 16
     hu, vu, nu = [UOp.from_buffer(b, dtypes.uint8) for b in (host, vram, new)]
     copyout, copyin = hu.store_call(vu), vu.store_call(nu)
-    run_linear(UOp(Ops.LINEAR, src=(copyout, copyin, copyout)), wait=True)
+    run_schedule(UOp(Ops.LINEAR, src=(copyout, copyin, copyout)), wait=True)
     self.assertEqual(bytes(host.host[:]), bytes(new.host[:]))
 
-  @patch.object(type(Device["NULL"]), "host", "CPU")
+  @patch.object(hcq2, "host_of", lambda _: "CPU")
   def test_staging(self):
     table = [("NULL", "NULL:1"), ("NULL", "CPU"), ("CPU", "NULL"), ("CL", "CPU"), ("CL", "METAL"), ("CL", "CPU", "NULL"),]
     for path in table:
@@ -202,7 +203,8 @@ class TestHostCalls(unittest.TestCase):
 
   def test_sink_calls_function(self): # a bare sink with args calls a function that writes one arg and takes the address of the other
     def sink(o:UOp, b:UOp):
-      return addr_of(UOp.param(0, dtypes.uint64, 1, name="o"), UOp.param(1, dtypes.uint8, 16, name="b")).sink().call(o, b, name="sink")
+      return addr_of(UOp.param(0, dtypes.uint64, 1, name="o"),
+                     UOp.param(1, dtypes.uint8, 16, name="b")).sink(arg=KernelInfo("sink")).call(o, b)
     outs, b = [self._buf(1) for _ in range(2)], self._buf(16, dtypes.uint8)
     for out in outs: self.assertEqual(self._run(sink, out, b), [b.buffer.get_buf("CPU")]) # the second run reuses the program
 
@@ -278,7 +280,7 @@ class TestHostCalls(unittest.TestCase):
     def put(out:UOp, v:UOp): return out.index(0).store(v).sink()
     a, b = [cpu_buf(dtype=dtypes.uint64, name=t) for t in ("cb", "enc")]
     lowered = lower_hcq(put(a, UOp.const(1, dtypes.uint64)), put(b, UOp.const(2, dtypes.uint64)))
-    self.assertEqual(len({c.body for c in lowered.toposort(enter_calls=True) if c.op is Ops.CALL and c.arg.name == "put"}), 1)
+    self.assertEqual(len({c.body for c in lowered.toposort(enter_calls=True) if c.op is Ops.CALL and c.body.arg.name == "put"}), 1)
 
   def test_one_function_with_registers(self): # a body numbers its own registers and loops: two traces are one function
     @uopfunc

@@ -32,7 +32,7 @@ class TestSymbolic(unittest.TestCase):
   def check_equal_z3(self, expr1, expr2):
     solver = z3.Solver()
     expr1, expr2 = uops_to_z3(solver, expr1, expr2)
-    self.assertEqual(solver.check(expr1 != expr2), z3.unsat, "simplified expression not equal to original")
+    self.assertEqual(solver.check(z3.simplify(expr1 != expr2)), z3.unsat, "simplified expression not equal to original")
 
   def helper_test_variable(self, v, n, m, s, test_z3:bool=True):
     v_simplified = graph_rewrite(v, sym, name="simplify symbolic uop")
@@ -981,9 +981,9 @@ class TestSymbolic(unittest.TestCase):
     self.helper_test_variable((a+b*2+c*4<1).ne(True), 0, 1, "(((a+b)+c)<1).eq(False)")
 
   def test_mul_by_zero_casted_to_emulated_dtype(self):
-    # a float zero cast to bfloat16 is one committed const, so the mul-by-zero fold still sees it
+    # the cast chain folds to one zero const, the float multiply stays: x can be inf or nan
     x = Variable("x", 0, 3, dtypes.bfloat16)
-    self.assertIs(graph_rewrite(x*uconst(0.0).cast(dtypes.float).cast(dtypes.bfloat16), sym), UOp.const(0.0, dtypes.bfloat16))
+    self.assertIs(graph_rewrite(x*uconst(0.0).cast(dtypes.float).cast(dtypes.bfloat16), sym), x*uconst(0.0))
 
   def test_cast_bool_to_int_ne_const(self):
     cond = Variable("a", 0, 3) < 2

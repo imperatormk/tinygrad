@@ -2,9 +2,9 @@ import unittest, struct, contextlib
 from tinygrad import Device, Tensor, dtypes, TinyJit
 from tinygrad.helpers import Context, ProfileRangeEvent, cpu_profile, cpu_events, flatten, ansistrip, perf_counter_us
 from tinygrad.device import Buffer, BufferSpec, Compiled, ProfileDeviceEvent, ProfileGraphEvent, HCQ_DEVS
-from tinygrad.engine.realize import run_linear
 from tinygrad.uop.ops import UOp, Ops
 from tinygrad.codegen import to_program
+from test.helpers import needs_devices, run_schedule
 
 def _dev_base(d):
   p = d.split(":")
@@ -55,12 +55,12 @@ class TestProfiler(unittest.TestCase):
     si = self.b.schedule_linear().src[-1]
 
     TestProfiler.prg = to_program(si.src[0], TestProfiler.d0.renderer)
-    run_linear(UOp(Ops.LINEAR, src=(TestProfiler.prg.call(TestProfiler.b.uop, TestProfiler.a.uop),)))
+    run_schedule(UOp(Ops.LINEAR, src=(TestProfiler.prg.call(TestProfiler.b.uop, TestProfiler.a.uop),)))
 
   def test_profile_kernel_run(self, wait=False):
     runner_name = ansistrip(TestProfiler.prg.src[0].arg.name)
     with helper_collect_profile(TestProfiler.d0) as profile:
-      run_linear(UOp(Ops.LINEAR, src=(TestProfiler.prg.call(TestProfiler.b.uop, TestProfiler.a.uop),)), wait=wait)
+      run_schedule(UOp(Ops.LINEAR, src=(TestProfiler.prg.call(TestProfiler.b.uop, TestProfiler.a.uop),)), wait=wait)
 
     helper_profile_filter_device(profile, TestProfiler.d0.device)
     profile = filter_ranges(profile)
@@ -76,7 +76,7 @@ class TestProfiler(unittest.TestCase):
   def test_profile_kernel_run_time_sync(self):
     with helper_collect_profile(TestProfiler.d0) as profile:
       st = perf_counter_us()
-      run_linear(UOp(Ops.LINEAR, src=(TestProfiler.prg.call(TestProfiler.b.uop, TestProfiler.a.uop),)))
+      run_schedule(UOp(Ops.LINEAR, src=(TestProfiler.prg.call(TestProfiler.b.uop, TestProfiler.a.uop),)))
     _, dev_ev = helper_profile_filter_device(profile, TestProfiler.d0.device)
     ev = next(e for e in profile if isinstance(e, ProfileGraphEvent))
     self.assertLess(abs(ev.sigs[ev.ents[0].st_id] + dev_ev.tdiff - st), 1e6) # kernel within 1s of its cpu time
@@ -99,7 +99,7 @@ class TestProfiler(unittest.TestCase):
 
     with helper_collect_profile(TestProfiler.d0) as profile:
       buf1.copy_from(src)
-      run_linear(UOp(Ops.LINEAR, src=(TestProfiler.prg.call(UOp.from_buffer(buf1, dtypes.float32), TestProfiler.a.uop),)))
+      run_schedule(UOp(Ops.LINEAR, src=(TestProfiler.prg.call(UOp.from_buffer(buf1, dtypes.float32), TestProfiler.a.uop),)))
       dst.copy_from(buf1)
 
     profile = filter_ranges(profile)
@@ -113,9 +113,9 @@ class TestProfiler(unittest.TestCase):
     #for i in range(1, 3):
     #  assert evs[i].st > evs[i-1].en, "timestamp not aranged"
 
+  @needs_devices(2)
   def test_profile_multidev(self):
-    try: d1 = Device[f"{Device.DEFAULT}:1"]
-    except Exception as e: self.skipTest(f"second device not available {e}")
+    d1 = Device[f"{Device.DEFAULT}:1"]
 
     buf1 = Buffer(Device.DEFAULT, 8, options=BufferSpec(nolru=True)).ensure_allocated()
     buf2 = Buffer(f"{Device.DEFAULT}:1", 8, options=BufferSpec(nolru=True)).ensure_allocated()
@@ -129,9 +129,9 @@ class TestProfiler(unittest.TestCase):
       evs = [x for x in profile if _dev_base(x.device) == dev]
       assert len(evs) == (0 if buf1._host_mv() is not None else 1), "one kernel runs are expected"
 
+  @needs_devices(2)
   def test_profile_multidev_transfer(self):
-    try: d1 = Device[f"{Device.DEFAULT}:1"]
-    except Exception as e: self.skipTest(f"second device not available {e}")
+    d1 = Device[f"{Device.DEFAULT}:1"]
     if Device.DEFAULT in {"CUDA", "CL"}: self.skipTest(f"{Device.DEFAULT} has no p2p: a transfer is two staged copies")
 
     buf1 = Tensor.randn(10, 10, device=f"{Device.DEFAULT}:0").realize()
@@ -143,9 +143,9 @@ class TestProfiler(unittest.TestCase):
     assert len(kernel_runs) == 1, "one kernel run is expected"
 
   @unittest.skipIf(Device.DEFAULT in "METAL", "METAL does not support queue wait interrupts")
+  @needs_devices(2)
   def test_profile_graph(self):
-    try: d1 = Device[f"{Device.DEFAULT}:1"]
-    except Exception as e: self.skipTest(f"second device not available {e}")
+    d1 = Device[f"{Device.DEFAULT}:1"]
     if Device.DEFAULT in {"CUDA", "CL"}: self.skipTest(f"{Device.DEFAULT} has no p2p: a transfer is two staged copies")
 
     def f(a):

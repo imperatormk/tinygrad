@@ -2,31 +2,29 @@
 from __future__ import annotations
 import time, functools, sys, inspect, pathlib, hashlib, weakref
 from dataclasses import dataclass, field, replace
-from typing import Callable, cast, get_args, ParamSpec, TypeVar, TYPE_CHECKING
+from typing import Callable, cast, ParamSpec, TypeVar, TYPE_CHECKING
 if TYPE_CHECKING: import numpy
 from tinygrad.dtype import DType, DTypeLike, dtypes, ConstType, least_upper_dtype, to_dtype, _from_np_dtype, _to_np_dtype, PyConst, AddrSpace
-from tinygrad.helpers import all_int, getenv, fetch, PROFILE, TracingKey, is_numpy_ndarray, prod, canonicalize_device_name
-from tinygrad.helpers import Context, cpu_profile, suppress_finalizing, disable_gc, VIZ, CAPTURING, is_disk_device, canonicalize_device
-from tinygrad.uop.ops import UOp, Ops, sint, Variable, ConstLike, PatternMatcher, UPat, GroupOp, graph_rewrite, rewrite_group, pm_drop_after
+from tinygrad.helpers import all_int, getenv, fetch, PROFILE, TracingKey, is_numpy_ndarray, prod, canonicalize_device_name, VALIDATE_WITH_CPU
+from tinygrad.helpers import Context, cpu_profile, disable_gc, VIZ, CAPTURING, is_disk_device, canonicalize_device, to_tuple
+from tinygrad.uop.ops import UOp, Ops, Variable, ConstLike, PatternMatcher, UPat, GroupOp, graph_rewrite, rewrite_group, pm_drop_after
 from tinygrad.uop.ops import KernelInfo, AxisType
-from tinygrad.mixin.rand import RandMixin
+from tinygrad.mixin import Mixin
 from tinygrad.codegen import create_linear, contiguous_mops_to_view
-from tinygrad.engine.realize import run_linear, capturing
-from tinygrad.device import Buffer
+from tinygrad.engine.realize import run_linear, capturing, compile_linear, link_linear
+from tinygrad.device import Buffer, Device, HCQ_RUNTIME_DEV, host_of
 
-# **** export: storage becomes EXTERN(slot), bound Variables lose their value and ALLOCs get canonical slots. ctx.externs is what's mapped back
+# **** export: storage becomes EXTERN(slot), bound Variables lose their value and ALLOCs get canonical slots. ctx.externs is what it's linked to
 
 @dataclass
 class ExportCtx:
   externs: dict[UOp, UOp] = field(default_factory=dict)
   allocs: dict[UOp, UOp] = field(default_factory=dict)
 
-def as_extern(x:UOp, slot:int) -> UOp: return x.replace(op=Ops.EXTERN, arg=replace(x.arg, slot=slot, buffer=None, name=None, val=None))
-
 def to_extern(ctx:ExportCtx, x:UOp) -> UOp|None:
   # realized storage and bound Variables are runtime state
   if not (x.is_bound_var or (x.op is Ops.BUFFER and x.addrspace is AddrSpace.GLOBAL)): return None
-  return ctx.externs.setdefault(x, as_extern(x, len(ctx.externs)))
+  return ctx.externs.setdefault(x, x.as_extern(len(ctx.externs)))
 
 # ALLOCs get canonical scope-local id slots so structurally identical calls hash identically for the schedule cache
 # (fresh slots are all positive from the global counter; negative slots are already canonical)
@@ -47,34 +45,6 @@ pm_export: PatternMatcher = PatternMatcher([
   (UPat(Ops.ALLOC, name="b"), canonicalize_alloc),
   (UPat(Ops.CALL, name="c"), export_call),
 ])
-
-def bind_alloc(b:UOp) -> UOp:
-  if b.device is None: raise RuntimeError("global storage needs a device, give the ALLOC one")
-  return UOp.new_buffer(b.device, b.max_numel(), b.dtype)
-
-# EXTERNs map back to their storage, bound Variables map back to the Variable, its value is in var_vals
-def map_back_extern(ctx:tuple[UOp, ...], e:UOp) -> UOp:
-  if e.arg.slot >= len(ctx) or as_extern(x:=ctx[e.arg.slot], e.arg.slot) is not e:
-    got = f"{x.dtype} {x.shape} on {x.device}" if e.arg.slot < len(ctx) else "nothing"
-    raise RuntimeError(f"extern {e.arg.slot} must match its EXTERN, {e.dtype} {e.shape} on {e.device}, got {got}")
-  return x.unbound() if x.is_variable else x
-
-pm_map_back = PatternMatcher([
-  (UPat(Ops.EXTERN, name="e"), map_back_extern),
-  # global ALLOCs are bound to fresh BUFFERs for this invocation
-  (UPat(Ops.ALLOC, name="b"), lambda b: bind_alloc(b) if b.addrspace is AddrSpace.GLOBAL else None),
-])
-
-def map_back(linear:UOp, externs:tuple[UOp, ...]) -> tuple[UOp, dict[str, int]]:
-  # the EXTERNs become the storage and the bound Variables of this invocation, ALLOCs get fresh storage
-  linear = graph_rewrite(linear, pm_map_back, ctx=externs, walk=True, name="map back")
-  # the values of the bound Variables the linear uses, they are call args
-  used_vars = {v.expr for si in linear.src for v in UOp.sink(*si.src[1:]).variables()}
-  var_vals: dict[str, int] = {}
-  for b in externs:
-    if b.is_bound_var and b.expr in used_vars and var_vals.setdefault(b.expr, b.arg.val) != b.arg.val:
-      raise RuntimeError(f"bind mismatch on {b.expr}, {var_vals[b.expr]} != {b.arg.val}")
-  return linear, var_vals
 
 # *** all in scope Tensors are here. this gets relevant UOps ***
 
@@ -105,7 +75,7 @@ def _fromnp(x: 'numpy.ndarray') -> UOp:
   ret.buffer.allocate(x)
   return ret.reshape(x.shape)
 
-class Tensor(RandMixin):
+class Tensor(Mixin):
   """
   A `Tensor` is a multi-dimensional matrix containing elements of a single data type.
 
@@ -134,7 +104,7 @@ class Tensor(RandMixin):
     # create a UOp from the different types of inputs
     if data is None:
       data = UOp.const(0.0, _dtype)
-    elif isinstance(data, get_args(ConstType)):
+    elif isinstance(data, ConstType):
       data = UOp.const(data, _dtype)
     elif is_numpy_ndarray(data) and data.shape == ():
       data = UOp.const(data.item(), _dtype or _from_np_dtype(data.dtype))
@@ -159,23 +129,19 @@ class Tensor(RandMixin):
     if _dtype is not None: self.uop = self.uop.cast(_dtype)
 
     # add to all_tensors after construction succeeds
-    all_tensors[weakref.ref(self)] = None
+    all_tensors[weakref.ref(self, all_tensors.pop)] = None
 
-  @suppress_finalizing
-  def __del__(self): all_tensors.pop(weakref.ref(self), None)
-
-  def _apply_uop(self, fxn:Callable[..., UOp], *x:Tensor, **kwargs) -> Tensor:
-    srcs = (self,)+x
-    if (new_uop:=fxn(*[t.uop for t in srcs], **kwargs)) is self.uop: return self
+  def _apply_uop(self, new_uop:UOp) -> Tensor:
+    if new_uop is self.uop: return self
     # directly create the Tensor
     ret = Tensor.__new__(Tensor)
     ret.uop, ret.grad, ret.is_param = new_uop, None, True
     # add to all_tensors after construction succeeds
-    all_tensors[weakref.ref(ret)] = None
+    all_tensors[weakref.ref(ret, all_tensors.pop)] = None
     return ret
 
   # alu, _uop, _wrap_uop and const are used by the mixins
-  def alu(self, op: Ops, *src: Tensor) -> Tensor: return self._apply_uop(lambda *u: u[0].alu(op, *u[1:]), *src)
+  def alu(self, op: Ops, *src: Tensor) -> Tensor: return self._apply_uop(self.uop.alu(op, *(t.uop for t in src)))
   @property
   def _uop(self) -> UOp: return self.uop
   @classmethod
@@ -200,15 +166,6 @@ class Tensor(RandMixin):
   def __len__(self):
     if not self.shape: raise TypeError("len() of a 0-d tensor")
     return self.shape[0]
-
-  @property
-  def device(self) -> str|tuple[str, ...]|None: return self.uop.device
-
-  @property
-  def shape(self) -> tuple[sint, ...]: return self.uop.shape
-
-  @property
-  def dtype(self) -> DType: return self.uop.dtype
 
   # ***** data handlers ****
 
@@ -276,30 +233,38 @@ class Tensor(RandMixin):
     tensor_map = dict(zip(tensor_map, UOp.sink(*tensor_map.values()).substitute(becomes_map, walk=True).src))
     _apply_map_to_tensors(becomes_map | tensor_map, name="bufferize")
     fn = graph_rewrite(stores, pm_export, ctx=(ctx:=ExportCtx()), bottom_up=True, name="export")
+    if len(names:=[v.expr for v in ctx.externs if v.is_bound_var]) != len(set(names)): raise RuntimeError(f"bind mismatch on a Variable in {names}")
     return fn, tuple(ctx.externs)
 
-  def linear_with_vars(self, *lst:Tensor) -> tuple[UOp, dict[str, int]]:
-    """Creates the LINEAR UOp needed to realize these Tensor(s), with Variables."""
+  def linear_with_externs(self, *lst:Tensor) -> tuple[UOp, tuple[UOp, ...]]:
+    """Creates the LINEAR UOp needed to realize these Tensor(s), with its externs."""
     fn, externs = self.export(*lst)
-    return map_back(Tensor.compile(fn), externs)
+    return create_linear(fn), externs
 
   def schedule_linear(self, *lst:Tensor) -> UOp:
     """Creates the schedule needed to realize these Tensor(s)."""
-    linear, var_vals = self.linear_with_vars(*lst)
-    assert len(var_vals) == 0
-    return linear
+    return self.linear_with_externs(*lst)[0]
 
   @staticmethod
-  @Context(ALLOW_DEVICE_USAGE=0)
   def compile(fn:UOp) -> UOp:
-    """Schedule a function from `Tensor.export` without binding its externs."""
-    return create_linear(fn)
+    """Compile a function from `Tensor.export` to a LINEAR of compiled calls without binding its externs. It reads the targets in DEV."""
+
+    # validate all targets are set
+    devs = {d for u in fn.toposort(enter_calls=True) for d in to_tuple(u.device) if d is not None}
+    for d in sorted({*devs, *map(host_of, devs), HCQ_RUNTIME_DEV.device}): Device.target_for(d)
+
+    with Context(ALLOW_DEVICE_USAGE=0): return compile_linear(create_linear(fn), validate=VALIDATE_WITH_CPU, cache=True)
+
+  @staticmethod
+  def link(linear:UOp, externs:tuple[UOp, ...]) -> UOp:
+    """Links a LINEAR from `Tensor.compile` to the externs from `Tensor.export`, it opens their devices."""
+    return link_linear(linear, list(externs))
 
   @staticmethod
   def run(linear:UOp, externs:tuple[UOp, ...], do_update_stats=True) -> None:
-    """Runs an exported function compiled to a LINEAR, its EXTERNs are the externs from `Tensor.export`."""
-    linear, var_vals = map_back(linear, externs)
-    run_linear(linear, var_vals, update_stats=do_update_stats)
+    """Links a LINEAR from `Tensor.compile` to the externs from `Tensor.export` and runs it."""
+    var_vals = {f"e{i}": x.arg.val for i,x in enumerate(externs) if x.is_bound_var}
+    run_linear(Tensor.link(linear, externs), var_vals, externs, update_stats=do_update_stats)
 
   @disable_gc()
   def realize(self, *lst:Tensor, do_update_stats=True) -> Tensor:
@@ -545,7 +510,7 @@ class Tensor(RandMixin):
     """
     all_uops = self.uop.toposort()
     # backward fills .grad for every in-scope float tensor with a device
-    tensors_need_grad: list[Tensor] = [t for tref in all_tensors if (t:=tref()) is not None and \
+    tensors_need_grad: list[Tensor] = [t for tref in list(all_tensors) if (t:=tref()) is not None and \
                                        t.uop in all_uops and t.is_floating_point() and t.device is not None]
     # clear contexts
     for t,g in zip(tensors_need_grad, self.gradient(*tensors_need_grad, gradient=gradient)):
@@ -557,8 +522,8 @@ class Tensor(RandMixin):
 
   # ***** movement ops *****
 
-  def _mop(self, op:Ops, arg) -> Tensor: return self._apply_uop(UOp._mop, op=op, arg=arg)
-  def _rop(self, op:Ops, axis:tuple[int, ...]) -> Tensor: return self._apply_uop(UOp._rop, op=op, axis=axis)
+  def _mop(self, op:Ops, arg) -> Tensor: return self._apply_uop(self.uop._mop(op, arg))
+  def _rop(self, op:Ops, axis:tuple[int, ...]) -> Tensor: return self._apply_uop(self.uop._rop(op, axis))
 
   def __setitem__(self, indices, v:Tensor|PyConst|list|tuple) -> None:
     if self.dtype in dtypes.weaks: raise RuntimeError("cannot setitem into a weak tensor; it has no storage")
@@ -569,7 +534,7 @@ class Tensor(RandMixin):
     v_uop, v_bw = (v.uop, v.uop.backward_slice) if isinstance(v, Tensor) else (None, {})
     if self.uop.op_in_backward_slice_with_self(Ops.BUFFER, Ops.ALLOC):
       shared = self.uop.base if self.uop.base.is_realized else None
-      if any(self.uop in t.uop.backward_slice_with_self and t.uop.base is not shared for tref in all_tensors
+      if any(self.uop in t.uop.backward_slice_with_self and t.uop.base is not shared for tref in list(all_tensors)
              if (t:=tref()) is not None and t is not self and t.uop is not v_uop and t.uop not in v_bw):
         raise RuntimeError("can't setitem on a tensor with other uses")
     idx = [indices] if (isinstance(indices, list) and all_int(indices)) or not isinstance(indices, (tuple, list)) else list(indices)
@@ -592,18 +557,18 @@ class Tensor(RandMixin):
   # ***** op wrappers *****
 
   # unlike Tensors, UOps are immutable, so these don't go in mixin
-  def __iadd__(self, x) -> Tensor: return self.assign(self.add(x)) # type: ignore[misc]
-  def __isub__(self, x) -> Tensor: return self.assign(self.sub(x)) # type: ignore[misc]
-  def __imul__(self, x) -> Tensor: return self.assign(self.mul(x)) # type: ignore[misc]
-  def __itruediv__(self, x) -> Tensor: return self.assign(self.div(x)) # type: ignore[misc]
-  def __ifloordiv__(self, x) -> Tensor: return self.assign(self.__floordiv__(x)) # type: ignore[misc]
-  def __ipow__(self, x) -> Tensor: return self.assign(self.pow(x)) # type: ignore[misc]
-  def __iand__(self, x) -> Tensor: return self.assign(self.bitwise_and(x)) # type: ignore[misc]
-  def __ior__(self, x) -> Tensor: return self.assign(self.bitwise_or(x)) # type: ignore[misc]
-  def __ixor__(self, x) -> Tensor: return self.assign(self.bitwise_xor(x)) # type: ignore[misc]
-  def __ilshift__(self, x) -> Tensor: return self.assign(self.lshift(x)) # type: ignore[misc]
-  def __irshift__(self, x) -> Tensor: return self.assign(self.rshift(x)) # type: ignore[misc]
-  def __imatmul__(self, x) -> Tensor: return self.assign(self.matmul(x)) # type: ignore[misc]
+  def __iadd__(self, x:Tensor|ConstType) -> Tensor: return self.assign(self.add(x))
+  def __isub__(self, x:Tensor|ConstType) -> Tensor: return self.assign(self.sub(x))
+  def __imul__(self, x:Tensor|ConstType) -> Tensor: return self.assign(self.mul(x))
+  def __itruediv__(self, x:Tensor|ConstType) -> Tensor: return self.assign(self.div(x))
+  def __ifloordiv__(self, x:Tensor|ConstType) -> Tensor: return self.assign(self.__floordiv__(x))
+  def __ipow__(self, x:Tensor|ConstType) -> Tensor: return self.assign(self.pow(x))
+  def __iand__(self, x:Tensor|ConstType) -> Tensor: return self.assign(self.bitwise_and(x))
+  def __ior__(self, x:Tensor|ConstType) -> Tensor: return self.assign(self.bitwise_or(x))
+  def __ixor__(self, x:Tensor|ConstType) -> Tensor: return self.assign(self.bitwise_xor(x))
+  def __ilshift__(self, x:Tensor|int) -> Tensor: return self.assign(self.lshift(x))
+  def __irshift__(self, x:Tensor|int) -> Tensor: return self.assign(self.rshift(x))
+  def __imatmul__(self, x:Tensor) -> Tensor: return self.assign(self.matmul(x))
 
   def __eq__(self, x) -> Tensor: return self.eq(x)                      # type: ignore[override]
 

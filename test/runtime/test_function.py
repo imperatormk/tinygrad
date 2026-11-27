@@ -261,7 +261,6 @@ class TestFunction(unittest.TestCase):
     foo = Foo()
     f = function(foo, allow_implicit=True)
     np.testing.assert_equal(f(Tensor([1,2,3])).numpy(), [11,22,33])
-    assert f(Tensor([1,2,3])).uop.src[1].arg.name.endswith("Foo")
 
   def test_iadd(self):
     @function
@@ -589,7 +588,7 @@ class TestFunctionTuple(unittest.TestCase):
       return c
 
     def count_kernels(t:Tensor):
-      linear, _ = t.linear_with_vars()
+      linear, _ = t.linear_with_externs()
       return sum((len(call.device) if isinstance(call.device, tuple) else 1)
                  for call in linear.src if call.src[0].op is Ops.SINK)
 

@@ -27,7 +27,7 @@ class TestSSARender(unittest.TestCase):
     assert_roundtrip(self, root)
 
   def _kernel(self, t:Tensor) -> UOp:
-    lin, _ = Tensor.linear_with_vars(t)
+    lin, _ = Tensor.linear_with_externs(t)
     return [c for c in lin.src if any(u.op is Ops.REDUCE for u in c.src[0].toposort())][0].src[0]
 
   def test_conv_kernel_graph(self):
@@ -47,6 +47,14 @@ class TestSSARender(unittest.TestCase):
     n = UOp.variable("n", 1, 64)
     g = UOp.sink(((n + 1) * 2) % 7, (n % 5) + UOp.const(Invalid))
     assert_roundtrip(self, g)
+
+  def test_template_param(self):
+    from tinygrad import Context
+    with Context(SPEC=0):
+      n = UOp.template("N", (1, 64))
+      eps = UOp.template("eps", (0.0, 1.0), dtype=dtypes.float32)
+      p = UOp.param(0, dtypes.float32, (n, 4))
+      assert_roundtrip(self, UOp.sink(p, (n + 1) * 2, eps))
 
   def test_buffer_in_call_body(self):
     b = Tensor.empty(8, device="NULL").realize().uop.buf_uop

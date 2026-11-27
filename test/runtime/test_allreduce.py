@@ -2,13 +2,12 @@ import unittest
 from tinygrad import Tensor, UOp, dtypes
 from tinygrad.helpers import Context
 from tinygrad.uop.ops import Ops
-from test.helpers import KernelCountException
-from tinygrad.engine.realize import run_linear
+from test.helpers import KernelCountException, run_schedule
 
 class TestRingAllReduce(unittest.TestCase):
   def test_hierarchy(self):
     ds = tuple(f"CPU:{i}" for i in range(4))
-    with Context(ALL2ALL=1, ALLREDUCE_NODE_NDEVS=2): # two nodes of 2
+    with Context(ALL2ALL=1, NODE_NDEVS=2): # two nodes of 2
       for size in (1, 17):
         x = (Tensor.arange(4 * size, dtype=dtypes.int32).reshape(4, size) % 13).realize()
         self.assertEqual(x.shard(ds, axis=0).sum(0).tolist(), x.sum(0).tolist())
@@ -21,7 +20,7 @@ class TestRingAllReduce(unittest.TestCase):
       x = Tensor.arange(N*M, dtype=dtypes.float).reshape(N, M)
       t = (x*x).clone().shard(ds, axis=0).realize()
       out = t.sum(0).mul(2.).contiguous()
-      linear, var_vals = out.linear_with_vars()
+      linear, externs = out.linear_with_externs()
       copies = [si for si in linear.src if si.src[0].op is Ops.STORE]
       sinks = [si for si in linear.src if si.src[0].op is Ops.SINK]
       # N*(N-1) copies for input and output
@@ -31,7 +30,7 @@ class TestRingAllReduce(unittest.TestCase):
       sink_count = (N*(N-1))+(N)+(N)+(1)+(1)
       if len(sinks) != sink_count: raise KernelCountException(sink_count, len(sinks))
       # correctness
-      run_linear(linear, var_vals)
+      run_schedule(linear, externs)
       expected = [2*sum((d*M+i)**2 for d in range(N)) for i in range(M)]
       dev_nums = Tensor.arange(1, N+1, dtype=dtypes.float).reshape(N, 1).expand(N, M).shard(ds, axis=0)
       shards = out.reshape(1, M).expand(N, M)+dev_nums

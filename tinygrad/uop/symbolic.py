@@ -120,7 +120,7 @@ def fold_const_where(gate:UOp, c0:UOp, c1:UOp, w:UOp) -> UOp:
   ret = c0 if gate.val else c1
   return ret.ccast(w.dtype) if ret.op is Ops.CONST and ret.dtype in dtypes.weaks and w.dtype not in dtypes.weaks else ret
 
-symbolic_simple = pm_data_invalid + PatternMatcher([
+sym_simple = pm_data_invalid + PatternMatcher([
   # ** self folding **
   (UPat({Ops.ADD, Ops.XOR, Ops.OR}, src=[UPat.var("x"), UPat.const(0)]), lambda x: x),  # x+0 / x^0 / x|0 -> x
   (UPat({Ops.SHL, Ops.SHR}, src=(UPat.var("x"), UPat.const(0))), lambda x: x),          # x<<0 / x>>0 -> x
@@ -176,13 +176,8 @@ symbolic_simple = pm_data_invalid + PatternMatcher([
   (UPat.var('x', dtype=dtypes.bool).maximum(UPat.var('y', dtype=dtypes.bool)), lambda x,y: x|y),
   # *** div rules ***
   (UPat.cvar('x', arg=0) / 0, lambda x: x.const_like(float('nan'))),   # 0/0 -> nan
-  # can be wrong if x or x2 is 0
-  (UPat.var("x") / UPat.var("x"), lambda x: x.const_like(1)),          # x/x -> 1
-  # x*0 -> 0 or 0*x -> 0
-  # if x is nan or inf it should render the nan value.
-  # NOTE: this can be wrong for loaded NaN
-  (UPat.var("x") * 0, lambda x: x.const_like(float("nan") if x.op is Ops.CONST
-                                             and isinstance(x.val, float) and (math.isnan(x.val) or math.isinf(x.val)) else 0)),
+  # x*0 -> 0, not for floats: inf*0 and nan*0 are nan
+  (UPat.var("x", dtypes.wints+(dtypes.bool,)) * 0, lambda x: x.const_like(0)),
   # *** cast/bitcast ***
   (UPat((Ops.CAST, Ops.BITCAST), name="root"), lambda root: root.src[0] if root.dtype == root.src[0].dtype else None),
   # a BITCAST reads its operand at the width it states, so a weak const is nonsense here: the bare arm is bool only
@@ -195,6 +190,7 @@ symbolic_simple = pm_data_invalid + PatternMatcher([
   (UPat.var("x").cast(dtypes.bool), lambda x: x != 0),
   # ** pow **
   (UPat.var("x").alu(Ops.POW, UPat.cvar("c")), simplify_pow),
+  (UPat.const(1).alu(Ops.POW, UPat.var()).named("p"), lambda p: p.const_like(1)),
   # positive const ** x
   (UPat.cvar("c").alu(Ops.POW, UPat.var("x")),
    lambda c,x: (x*math.log2(c.val)).exp2() if c.val > 0 and dtypes.is_float(x.dtype) else None),
@@ -206,7 +202,8 @@ symbolic_simple = pm_data_invalid + PatternMatcher([
   # a conditional with the same results either way is a noop, also fold const conditionals
   (UPat.var().where(UPat.var("val"), UPat.var("val")), lambda val: val),
   (UPat.cvar("gate").where(UPat.var("c0"), UPat.var("c1")).named("w"), fold_const_where),
-])+mop_cleanup
+])
+symbolic_simple = sym_simple+mop_cleanup
 
 # ******** phase 2 builds on phase 1, it includes the old "symbolic", rules that match deeper ********
 
@@ -238,10 +235,10 @@ commutative = PatternMatcher([
 
 def fold_where_closure(cond:UOp, t:UOp, f:UOp) -> UOp|None:
   """in cond.where(t, f), cond is True within t and False within f"""
-  if cond not in t.bool_slice and cond not in f.bool_slice: return None
   # INDEX gates are owned by the valid/store-coalescing machinery, leave them alone
   if any(u.op_in_backward_slice_with_self(Ops.INDEX) for u in (cond, t, f)): return None
-  return cond.where(t.substitute({cond: cond.const_like(True)}), f.substitute({cond: cond.const_like(False)}))
+  nt, nf = t.substitute({cond: cond.const_like(True)}), f.substitute({cond: cond.const_like(False)})
+  return None if nt is t and nf is f else cond.where(nt, nf)
 
 symbolic = symbolic_simple+commutative+PatternMatcher([
   # ** boolean algebra **
@@ -255,7 +252,7 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   ((UPat.var("y") + UPat.var("x", dtypes.wints) * UPat.cvar("c0")) + UPat.var("x") * UPat.cvar("c1"),
    lambda x,y,c0,c1: y+m if fits(x, c0.vmin+c1.vmin) and no_overflow(m:=x*(c0+c1)) else None),
   (UPat.var("x") + UPat.var("x") * UPat.cvar("c"), # (x+x*c)-> x*(c+1)
-   lambda x,c: x*(c+1) if (x.dtype in dtypes.wints or c.arg == -1) and fits(x, c.vmin+1) else None),
+   lambda x,c: x*(c+1) if x.dtype in dtypes.wints and fits(x, c.vmin+1) else None),
   ((UPat.var("y") + UPat.var("x", dtypes.wints)) + UPat.var("x") * UPat.cvar("c"),
    lambda x,y,c: y+m if fits(x, c.vmin+1) and no_overflow(m:=x*(c+1)) else None),
   ((UPat.var("y") + UPat.var("x", dtypes.wints) * UPat.cvar("c")) + UPat.var("x"),
@@ -286,7 +283,7 @@ symbolic = symbolic_simple+commutative+PatternMatcher([
   (UPat.var("c").where(UPat.var("t"), 0) + UPat.var("c").where(0, UPat.var("f")), lambda c,t,f: c.where(t, f)),
   # ALU/variable min==max -> CONST
   (UPat({Ops.CMPLT, Ops.CMPEQ, Ops.DIV, Ops.MOD, Ops.PARAM, Ops.EXTERN, Ops.SPECIAL}, name="x"),
-   lambda x: x.const_like(x.vmin) if x.dtype is not dtypes.void and x.vmin == x.vmax else None),
+   lambda x: x.const_like(x.vmin) if x.dtype is not dtypes.void and not x.is_template and x.vmin == x.vmax else None),
   (UPat(Ops.RANGE, src=(UPat.cvar().or_casted(),), name="x"), lambda x: x.const_like(x.vmin) if x.vmin == x.vmax else None),
   # max folding
   ((UPat.cvar("a") < UPat.var("b")).where(UPat.var("b"), UPat.cvar("c")), lambda a,b,c: UOp.maximum(a,b) if a.val == c.val else None),
