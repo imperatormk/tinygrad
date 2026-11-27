@@ -20,11 +20,19 @@ class Compiler:
     return lib
   def disassemble(self, lib:bytes): pass
   def server(self, cmd:str, arch:str, *args) -> subprocess.Popen:
-    argv = f"{cmd} {pathlib.Path(__file__).parent.parent}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}"
-    return subprocess.Popen(argv.split() + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=0)
+    argv = f"{cmd} {pathlib.Path(__file__).parents[1]}/runtime/support/compileserver.py {type(self).__module__}:{type(self).__name__} {arch}".split()
+    self._server = lambda: subprocess.Popen(argv + [str(a) for a in args], stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+    return self._server()
   def compile_server(self, src:str, proc:subprocess.Popen) -> bytes:
-    unwrap(proc.stdin).write(struct.pack("I", len(src.encode())) + src.encode())
-    if (lib:=unwrap(proc.stdout).read(struct.unpack("I", unwrap(proc.stdout).read(4))[0])): return lib
+    if proc.poll() is not None: proc = self.compiler_process = self._server()
+    try:
+      unwrap(proc.stdin).write(struct.pack("I", len(b:=src.encode())) + b)
+      unwrap(proc.stdin).flush()
+      if len(lib:=unwrap(proc.stdout).read(n:=struct.unpack("I", unwrap(proc.stdout).read(4))[0])) != n: raise EOFError
+    except BaseException:
+      with proc: proc.kill()
+      raise
+    if lib: return lib
     raise CompileError("Compilation Error")
 
 
@@ -122,7 +130,9 @@ class Renderer:
   compiler: Compiler = Compiler()
 
   def __init__(self, target:Target): self.target = target
-  def __reduce__(self): return self.__class__, (self.target,)
+  def __reduce__(self):
+    from tinygrad.device import select_renderer
+    return select_renderer, (self.target,)
   def render(self, uops:list[UOp]) -> str: raise NotImplementedError("needs a renderer")
   def asm(self, prg:UOp, lin:UOp) -> bytes: raise NotImplementedError("needs an assembler")
   def supported_dtypes(self) -> set[DType]:
